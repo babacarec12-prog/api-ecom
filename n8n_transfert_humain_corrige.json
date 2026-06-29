@@ -1,0 +1,93 @@
+{
+  "name": "transfer_to_human - corrigé",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {"name": "customer_id"},
+            {"name": "customer_message"},
+            {"name": "reason"},
+            {"name": "session_id"}
+          ]
+        }
+      },
+      "id": "760530a9-2a82-4ef6-ab03-7fc25db79e8e",
+      "name": "Appelé par l'Agent IA",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\nreturn [{\n  json: {\n    customer_id: String(input.customer_id ?? input.user_id ?? input.userId ?? 'inconnu'),\n    customer_message: String(input.customer_message ?? input.message ?? 'Message non fourni'),\n    reason: String(input.reason ?? 'Intervention humaine demandée par l’Agent IA'),\n    session_id: String(input.session_id ?? ''),\n    requested_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "04a2abcc-febc-43b0-95fd-f1d73037a36d",
+      "name": "Préparer transfert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "sessionId": "={{ $json.session_id }}",
+        "chatId": "REMPLACE_NUMERO_CONSEILLER@c.us",
+        "message": "={{ '🚨 Transfert humain demandé\n\nClient : ' + $json.customer_id + '\nMotif : ' + $json.reason + '\nMessage : ' + $json.customer_message }}"
+      },
+      "id": "e7d39e29-ec8f-4e9d-b0c3-e4e58a9bde48",
+      "name": "Notifier conseiller OpenWA",
+      "type": "@rmyndharis/n8n-nodes-openwa.openWa",
+      "typeVersion": 1,
+      "position": [750, 300],
+      "credentials": {
+        "openWaApi": {
+          "id": "onObfWB7kdMkd5xj",
+          "name": "OpenWA account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const handoff = $('Préparer transfert').first().json;\n\nreturn [{\n  json: {\n    success: true,\n    handoff: true,\n    customer_id: handoff.customer_id,\n    reason: handoff.reason,\n    response: 'Je vous transfère à un conseiller humain. Il vous répondra dès que possible.'\n  }\n}];"
+      },
+      "id": "6ee55143-f989-447f-802a-ac8b4db40dcc",
+      "name": "Confirmer transfert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "content": "## Configuration\n\n1. Remplacer `REMPLACE_NUMERO_CONSEILLER@c.us` par le Chat ID OpenWA du conseiller.\n2. Vérifier le credential OpenWA.\n3. Importer ce workflow avant le workflow principal.\n4. Dans l’outil `transfer_to_human` du workflow principal, sélectionner ce workflow et associer les quatre entrées.",
+        "height": 260,
+        "width": 430,
+        "color": 5
+      },
+      "id": "8f3d1a11-ef2b-4429-865a-5daa043ce81b",
+      "name": "Instructions",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [470, -30]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Appelé par l'Agent IA": {
+      "main": [[{"node": "Préparer transfert", "type": "main", "index": 0}]]
+    },
+    "Préparer transfert": {
+      "main": [[{"node": "Notifier conseiller OpenWA", "type": "main", "index": 0}]]
+    },
+    "Notifier conseiller OpenWA": {
+      "main": [[{"node": "Confirmer transfert", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

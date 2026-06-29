@@ -1,0 +1,142 @@
+{
+  "name": "Transfert humain - AI Commerce Assistant",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "2ccb94ae-fd9b-4b03-8c39-a854da6c4981",
+      "name": "Appelé par l'Agent IA",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\nreturn [{\n  json: {\n    customer_id: input.customer_id ?? input.user_id ?? input.userId ?? input.phone ?? 'inconnu',\n    customer_message: input.customer_message ?? input.message ?? input.chatInput ?? 'Message non fourni',\n    reason: input.reason ?? 'Intervention humaine demandée par l’Agent IA',\n    human_mode: true,\n    requested_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "11d96314-06bc-46b0-9e9c-41583bef08e2",
+      "name": "Préparer le transfert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v22.0/REMPLACE_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer REMPLACE_TOKEN_WHATSAPP"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ messaging_product: 'whatsapp', to: 'REMPLACE_NUMERO_CONSEILLER', type: 'text', text: { body: '🚨 Transfert humain demandé\\n\\nClient : ' + $json.customer_id + '\\nMotif : ' + $json.reason + '\\nMessage : ' + $json.customer_message } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "0c3d3c7c-8da7-4315-91d5-f112ef9ea31f",
+      "name": "Notifier le conseiller WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const handoff = $('Préparer le transfert').first().json;\n\nreturn [{\n  json: {\n    success: true,\n    handoff: true,\n    human_mode: true,\n    customer_id: handoff.customer_id,\n    reason: handoff.reason,\n    response: 'Je vous transfère à un conseiller humain. Il vous répondra dès que possible.'\n  }\n}];"
+      },
+      "id": "4e3c34e4-085d-437d-9615-a972d44fba43",
+      "name": "Confirmer le transfert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Configuration obligatoire\n\nDans **Notifier le conseiller WhatsApp**, remplacer :\n\n- `REMPLACE_PHONE_NUMBER_ID`\n- `REMPLACE_TOKEN_WHATSAPP`\n- `REMPLACE_NUMERO_CONSEILLER`\n\nLe numéro doit inclure l'indicatif pays sans `+`.\n\nPour la production, placez le token dans un credential Header Auth au lieu de le conserver dans le nœud.",
+        "height": 320,
+        "width": 420,
+        "color": 5
+      },
+      "id": "6d041763-f916-47d5-ac05-7793914206a0",
+      "name": "Instructions",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        520,
+        -80
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Appelé par l'Agent IA": {
+      "main": [
+        [
+          {
+            "node": "Préparer le transfert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Préparer le transfert": {
+      "main": [
+        [
+          {
+            "node": "Notifier le conseiller WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notifier le conseiller WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Confirmer le transfert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "43e85979-cf0a-409f-b632-b80f3e8d166a",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
