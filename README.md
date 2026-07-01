@@ -1,7 +1,7 @@
 # AI Commerce Assistant API
 
-API Django REST à endpoint unique pour relier un agent IA/n8n à Shopify,
-WooCommerce et Stripe.
+API Django REST à endpoint unique pour relier un agent IA/n8n à WooCommerce
+et PayTech pendant la phase MVP.
 
 ## Installation
 
@@ -39,7 +39,7 @@ Pour `create_order`, la plateforme peut être indiquée une fois :
   "action": "create_order",
   "data": {
     "user_id": "2250XXXXXXXX",
-    "platform": "shopify",
+    "platform": "woocommerce",
     "cart": [
       {"product_id": "123", "variant_id": "789", "quantity": 2}
     ]
@@ -47,15 +47,42 @@ Pour `create_order`, la plateforme peut être indiquée une fois :
 }
 ```
 
-Elle peut également figurer dans chaque article. Un panier mixant Shopify et
-WooCommerce est refusé, car chaque plateforme doit créer sa propre commande.
-`variant_id` est facultatif : la première variante Shopify est alors utilisée.
+Elle peut également figurer dans chaque article. Pendant le MVP, seule la
+valeur `woocommerce` est acceptée. `variant_id` est facultatif pour un produit
+WooCommerce simple et requis lorsque le client choisit une variante précise.
 
-Pour `get_order_status`, fournir `platform` est recommandé. Sans ce champ, l'API
-cherche la commande successivement sur Shopify et WooCommerce.
+Pour `get_order_status`, `platform` est facultatif et vaut toujours
+`woocommerce` pendant le MVP.
 
-Le champ `amount` de `generate_payment` doit être exprimé dans la plus petite
-unité Stripe de la devise configurée (par exemple `8900` XOF).
+Actions WooCommerce complémentaires disponibles :
+
+- `cancel_order` : annuler une commande ;
+- `request_refund` : enregistrer une demande de remboursement sans mouvement financier automatique ;
+- `update_order` : modifier les quantités des lignes existantes ;
+- `get_tracking` : lire le transporteur, le numéro et l’URL de suivi ;
+- `validate_coupon` : vérifier un code promotionnel ;
+- `check_variant_stock` : vérifier le prix et le stock exacts d’une variante.
+
+Les exemples JSON et limites sont détaillés dans `woocommerce-actions.md`.
+
+Le champ `amount` de `generate_payment` doit être un montant entier positif dans
+la devise PayTech configurée (par exemple `8900` XOF). La réponse contient
+`payment_url`, `token`, `reference` et `provider: paytech`.
+
+Configurer PayTech dans `.env` :
+
+```dotenv
+PAYTECH_API_KEY=votre_cle_api
+PAYTECH_API_SECRET=votre_cle_secrete
+PAYTECH_API_URL=https://paytech.sn/api/payment/request-payment
+PAYTECH_CURRENCY=XOF
+PAYTECH_ENV=test
+PAYTECH_IPN_URL=https://votre-domaine.example/api/paytech/ipn/
+PAYTECH_SUCCESS_URL=https://votre-domaine.example/paiement/succes/
+PAYTECH_CANCEL_URL=https://votre-domaine.example/paiement/annule/
+```
+
+Utiliser `PAYTECH_ENV=prod` uniquement avec les clés et URL de production.
 
 ## Démarrage public pour n8n Cloud
 
