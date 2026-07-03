@@ -947,6 +947,31 @@ class DatabaseCatalogTests(TestCase):
             UserOrder.objects.filter(order_id=result["order_id"], platform="database").exists()
         )
 
+    def test_full_message_flow_is_idempotent_and_clears_cart(self):
+        def turn(message_id, message):
+            return self.post(
+                "message_turn",
+                {
+                    "user_id": "full-message-db-user",
+                    "session_key": "full-message-db",
+                    "message_id": message_id,
+                    "message": message,
+                },
+            )
+
+        self.assertEqual(turn("m1", "Produit Test Dakar").status_code, 200)
+        selected = turn("m2", "1")
+        self.assertIn("Produit Test Dakar", selected.json()["data"]["message"])
+        self.assertEqual(turn("m3", "oui").status_code, 200)
+        staged = turn("m4", "je le commande")
+        self.assertIn("confirmer", staged.json()["data"]["message"].casefold())
+        confirmed = turn("m5", "oui")
+        self.assertEqual(confirmed.status_code, 200)
+        repeated = turn("m5", "oui")
+        self.assertEqual(repeated.json()["data"], confirmed.json()["data"])
+        self.assertEqual(Product.objects.get(external_id="DB-TEST").stock, 4)
+        self.assertFalse(Cart.objects.filter(user_id="full-message-db-user").exists())
+
 
 class MessageTurnTests(TestCase):
     def setUp(self):

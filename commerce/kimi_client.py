@@ -155,6 +155,12 @@ class KimiClient:
         )
         if forbidden_wolof:
             raise CommerceError("Kimi n'a pas répondu strictement en français.", 502)
+        forbidden_english = re.search(
+            r"\b(awesome|great|hello|thanks|thank you|must-have|sure)\b",
+            answer.casefold(),
+        )
+        if forbidden_english:
+            raise CommerceError("Kimi n'a pas répondu strictement en français.", 502)
         safe_numbers = re.findall(r"\d+", str(safe_answer))
         answer_numbers = re.findall(r"\d+", answer)
         if any(number not in answer_numbers for number in safe_numbers):

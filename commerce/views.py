@@ -257,7 +257,10 @@ def _idempotent(action, data, callback):
         # Un échec ne doit pas bloquer définitivement une nouvelle tentative sûre.
         reservation.delete()
         raise
-    reservation.result = result
+    # JSONField PostgreSQL refuse notamment Decimal et certains objets issus
+    # des fournisseurs. La réponse client reste identique, mais la copie
+    # idempotente est toujours convertie en JSON pur avant sauvegarde.
+    reservation.result = json.loads(json.dumps(result, default=str))
     reservation.save(update_fields=["result"])
     return result
 
@@ -475,9 +478,11 @@ def _create_order(data):
         _move_state(
             state,
             "ordering",
+            pending_product_id=None,
             pending_order_id=result["order_id"],
             pending_amount=_decimal(result["montant_total"], "montant_total"),
         )
+        Cart.objects.filter(user_id=str(data["user_id"])).delete()
         return result
 
     return _idempotent("create_order", data, execute)
@@ -1372,6 +1377,17 @@ def _format_french_message(analysis, commerce_result):
         )
     if intention == "cancel_pending_action":
         return "L'action en attente a été annulée."
+    # Une commande contient aussi une liste ``items``. Elle doit être formatée
+    # comme une commande avant le cas générique du panier, dont le contrat exige
+    # un champ ``total`` qui n'existe pas dans le résultat de création de commande.
+    if (
+        commerce_result.get("executed")
+        and intention == "create_order"
+        and result.get("order_id")
+    ):
+        total = result.get("montant_total", result.get("total"))
+        suffix = f" Total : {_money(total)} {result.get('devise', 'XOF')}." if total not in (None, "") else ""
+        return f"Votre commande est confirmée. Référence : {result['order_id']}.{suffix}"
     if isinstance(result.get("products"), list):
         products = result["products"][:10]
         if not products:
