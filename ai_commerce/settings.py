@@ -104,6 +104,11 @@ TIME_ZONE = "Africa/Dakar"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 N8N_API_TOKEN = "" if TESTING else os.getenv("N8N_API_TOKEN", "").strip()
 COMMERCE_RATE_LIMIT = int(os.getenv("COMMERCE_RATE_LIMIT", "60"))
+COMMERCE_CATALOG_PROVIDER = (
+    "woocommerce"
+    if TESTING
+    else os.getenv("COMMERCE_CATALOG_PROVIDER", "database").strip().lower()
+)
 KIMI_API_KEY = os.getenv("KIMI_API_KEY", "").strip()
 KIMI_MODEL = os.getenv("KIMI_MODEL", "moonshot-v1-8k").strip()
 KIMI_TIMEOUT = int(os.getenv("KIMI_TIMEOUT", "15"))

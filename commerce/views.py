@@ -17,6 +17,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .exceptions import CommerceError
+from .database_client import DatabaseCatalogClient
 from .kimi_client import KimiClient
 from .models import (
     Cart,
@@ -102,17 +103,30 @@ def _decimal(value, field, *, positive=False):
 
 def _platform(value):
     normalized = str(value or "").strip().casefold()
-    aliases = {"woo": "woocommerce", "woocommerce": "woocommerce"}
+    aliases = {
+        "woo": "woocommerce",
+        "woocommerce": "woocommerce",
+        "db": "database",
+        "database": "database",
+    }
     if normalized not in aliases:
         raise CommerceError(
-            "Cette API MVP accepte uniquement la plateforme 'woocommerce'.", 400
+            "Cette API accepte uniquement les plateformes 'database' ou 'woocommerce'.",
+            400,
         )
     return aliases[normalized]
 
 
+def _catalog_platform():
+    provider = str(
+        getattr(settings, "COMMERCE_CATALOG_PROVIDER", "database") or "database"
+    ).strip().casefold()
+    return _platform(provider)
+
+
 def _client(platform):
-    _platform(platform)
-    return WooCommerceClient()
+    platform = _platform(platform)
+    return DatabaseCatalogClient() if platform == "database" else WooCommerceClient()
 
 
 def _woo_only(data):
@@ -125,10 +139,14 @@ def _validate_cart(cart, default_platform=None):
     if not isinstance(cart, list) or not cart:
         raise CommerceError("Le panier doit être une liste non vide.", 400)
     cleaned = []
+    selected_platform = None
     for index, item in enumerate(cart):
         if not isinstance(item, dict) or not item.get("product_id"):
             raise CommerceError(f"L'article {index + 1} doit contenir product_id.", 400)
         platform = _platform(item.get("platform") or default_platform)
+        if selected_platform and platform != selected_platform:
+            raise CommerceError("Un panier ne peut pas mélanger plusieurs plateformes.", 400)
+        selected_platform = platform
         try:
             quantity = int(item.get("quantity", 1))
         except (TypeError, ValueError) as exc:
@@ -136,7 +154,7 @@ def _validate_cart(cart, default_platform=None):
         if quantity <= 0:
             raise CommerceError(f"La quantité de l'article {index + 1} doit être positive.", 400)
         cleaned.append({**item, "quantity": quantity, "platform": platform})
-    return "woocommerce", cleaned
+    return selected_platform, cleaned
 
 
 def _state(user_id):
@@ -245,7 +263,9 @@ def _idempotent(action, data, callback):
 
 def _search(data):
     _required(data, "query")
-    products = WooCommerceClient().search_products(str(data["query"]).strip())
+    products = _client(data.get("platform") or _catalog_platform()).search_products(
+        str(data["query"]).strip()
+    )
 
     # n8n affiche au maximum dix résultats. Lorsque l'identifiant WhatsApp est
     # fourni, enregistrer ici exactement cette liste évite de demander au LLM
@@ -284,7 +304,7 @@ def _cart_add(data):
     if quantity <= 0:
         raise CommerceError("La quantité doit être un entier positif.", 400)
     price = _decimal(data["price"], "price")
-    _platform(data.get("platform", "woocommerce"))
+    platform = _platform(data.get("platform") or _catalog_platform())
     row, created = Cart.objects.get_or_create(
         user_id=str(data["user_id"]),
         product_id=str(data["product_id"]),
@@ -292,7 +312,7 @@ def _cart_add(data):
             "product_name": str(data["product_name"]),
             "quantity": quantity,
             "price": price,
-            "platform": "woocommerce",
+            "platform": platform,
             "idempotency_key": data.get("idempotency_key"),
         },
     )
@@ -300,6 +320,7 @@ def _cart_add(data):
         row.quantity += quantity
         row.product_name = str(data["product_name"])
         row.price = price
+        row.platform = platform
         row.save()
     state = _state(data["user_id"])
     if state.state == "browsing":
@@ -393,7 +414,7 @@ def _get_product_by_position(data):
         "product_id": row.product_id,
         "product_name": row.product_name,
         "price": str(row.price) if row.price is not None else None,
-        "platform": "woocommerce",
+        "platform": _catalog_platform(),
     }
 
 
@@ -430,7 +451,7 @@ def _create_order(data):
         state = _state(data["user_id"])
         if state.state != "confirming":
             raise CommerceError("La commande exige une confirmation explicite préalable.", 409)
-        platform = _platform(data.get("platform", "woocommerce"))
+        platform = _platform(data.get("platform") or _catalog_platform())
         source_cart = data.get("cart")
         if source_cart is None:
             source_cart = [
@@ -438,10 +459,17 @@ def _create_order(data):
                 for row in Cart.objects.filter(user_id=str(data["user_id"]))
             ]
         _, cart = _validate_cart(source_cart, platform)
-        result = WooCommerceClient().create_order(data["user_id"], cart)
+        result = _client(platform).create_order(data["user_id"], cart)
         UserOrder.objects.update_or_create(
             order_id=result["order_id"],
-            defaults={"user_id": str(data["user_id"]), "platform": "woocommerce"},
+            defaults={
+                "user_id": str(data["user_id"]),
+                "platform": platform,
+                "amount_total": _decimal(result["montant_total"], "montant_total"),
+                "currency": result.get("devise", "XOF"),
+                "status": result.get("statut", "pending"),
+                "items": result.get("items", []),
+            },
         )
         _move_state(
             state,
@@ -470,6 +498,18 @@ def _generate_payment(data):
 
 
 def _get_order_status(data):
+    row = UserOrder.objects.filter(
+        order_id=str(data.get("order_id")), user_id=str(data.get("user_id"))
+    ).first()
+    if row and row.platform == "database":
+        return {
+            "order_id": row.order_id,
+            "statut": row.status,
+            "montant_total": str(row.amount_total or 0),
+            "devise": row.currency,
+            "items": row.items,
+            "plateforme": "database",
+        }
     woo = _owned_order(data)
     return woo.get_order_status(data["order_id"])
 
@@ -666,7 +706,7 @@ def _conversation_turn(data):
         }
 
     if affirmative and state.state == "selecting" and state.pending_product_id:
-        product = WooCommerceClient().get_product(state.pending_product_id)
+        product = _client(_catalog_platform()).get_product(state.pending_product_id)
         price = product.get("prix")
         if price in (None, ""):
             raise CommerceError("Le prix de ce produit est indisponible.", 409)
@@ -677,7 +717,7 @@ def _conversation_turn(data):
                 "product_name": product.get("nom") or "Produit",
                 "quantity": 1,
                 "price": price,
-                "platform": "woocommerce",
+                "platform": _catalog_platform(),
             }
         )
         return {
@@ -791,7 +831,7 @@ def _dispatch_intent(data):
         }
 
     payload = {key: value for key, value in params.items() if value not in (None, "")}
-    payload.update({"user_id": user_id, "platform": "woocommerce"})
+    payload.update({"user_id": user_id, "platform": _catalog_platform()})
 
     if intention == "search_products":
         payload["query"] = str(payload.get("query") or "*").strip()
@@ -810,7 +850,7 @@ def _dispatch_intent(data):
             product_id = _get_product_by_position(payload)["product_id"]
         if not product_id:
             return _intent_clarification(intention, "Quel produit souhaitez-vous ajouter au panier ?")
-        product = WooCommerceClient().get_product(product_id)
+        product = _client(_catalog_platform()).get_product(product_id)
         if product.get("prix") in (None, ""):
             raise CommerceError("Le prix de ce produit est indisponible.", 409)
         result = _cart_add({
@@ -819,7 +859,7 @@ def _dispatch_intent(data):
             "product_name": product.get("nom") or "Produit",
             "quantity": payload.get("quantity", 1),
             "price": product["prix"],
-            "platform": "woocommerce",
+            "platform": _catalog_platform(),
         })
     elif intention in {"cart_remove", "cart_update_quantity"}:
         product_id = payload.get("product_id") or state.pending_product_id

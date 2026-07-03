@@ -3,6 +3,22 @@
 API Django REST à endpoint unique pour relier un agent IA/n8n à WooCommerce
 et PayTech pendant la phase MVP.
 
+## Catalogue de démonstration en base de données
+
+Définir `COMMERCE_CATALOG_PROVIDER=database` active le catalogue PostgreSQL ou
+SQLite interne. La migration `0005_database_catalog` crée cinq produits de
+démonstration et permet de tester la recherche, la sélection, le panier et la
+création de commande sans WooCommerce.
+
+Lorsque la boutique WooCommerce devient publique, remplacer simplement par :
+
+```dotenv
+COMMERCE_CATALOG_PROVIDER=woocommerce
+WOO_STORE_URL=https://boutique.example.com
+```
+
+Le workflow n8n et le contrat `message_turn` ne changent pas.
+
 ## Installation
 
 ```powershell

@@ -14,6 +14,7 @@ from commerce.models import (
     HumanTransfer,
     ProcessedRequest,
     ProductSelection,
+    Product,
     ShopPolicy,
     UserOrder,
 )
@@ -854,6 +855,96 @@ class PersistentCommerceActionsTests(TestCase):
         self.assertEqual(response.status_code, 200)
         woo_class.return_value.update_order.assert_called_once_with(
             "77", [{"id": 4, "quantity": 2}]
+        )
+
+
+@override_settings(COMMERCE_CATALOG_PROVIDER="database")
+class DatabaseCatalogTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.user_id = "221700000077"
+        Product.objects.create(
+            external_id="DB-TEST",
+            name="Produit Test Dakar",
+            description="Produit réservé aux tests du catalogue interne.",
+            category="Test",
+            price="5000",
+            stock=5,
+            sku="TEST-001",
+        )
+
+    def post(self, action, data):
+        return self.client.post(
+            "/api/commerce/", {"action": action, "data": data}, format="json"
+        )
+
+    def test_database_catalog_cart_and_order_flow(self):
+        search = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "session_key": "db-test",
+                "intention": "search_products",
+                "params": {"query": "Produit Test Dakar"},
+                "confidence": 1,
+            },
+        )
+        self.assertEqual(search.status_code, 200)
+        products = search.json()["data"]["result"]["products"]
+        self.assertEqual(products[0]["id"], "DB-TEST")
+
+        selected = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "get_product",
+                "params": {"position": 1},
+                "confidence": 1,
+            },
+        )
+        self.assertEqual(
+            selected.json()["data"]["result"]["selected_product"]["product_id"],
+            "DB-TEST",
+        )
+
+        added = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "cart_add",
+                "params": {"quantity": 2},
+                "confidence": 1,
+            },
+        )
+        self.assertEqual(added.json()["data"]["result"]["total"], "10000.00")
+
+        staged = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "create_order",
+                "params": {},
+                "confidence": 1,
+                "timestamp": "db-order-1",
+            },
+        )
+        self.assertTrue(staged.json()["data"]["requires_confirmation"])
+        confirmed = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "confirm_action",
+                "params": {},
+                "confidence": 1,
+            },
+        )
+        result = confirmed.json()["data"]["result"]
+        self.assertTrue(result["order_id"].startswith("DB-"))
+        self.assertEqual(result["montant_total"], "10000.00")
+        self.assertEqual(Product.objects.get(external_id="DB-TEST").stock, 3)
+        self.assertTrue(
+            UserOrder.objects.filter(order_id=result["order_id"], platform="database").exists()
         )
 
 
