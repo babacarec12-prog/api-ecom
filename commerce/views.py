@@ -1468,21 +1468,11 @@ def _message_turn_uncached(data):
         }
     basic = BASIC_FRENCH_RESPONSES.get(_normalise_message(message))
     if basic:
-        analysis = {
-            "intention": "other",
-            "params": {},
-            "confidence": 1,
-            "langue_detectee": "français",
-            "reformulation": message,
-        }
-        answer, formulation_degraded = _naturalize_answer(
-            message, analysis, {"executed": False, "intention": "other"}, basic, trace_id
-        )
         return {
-            "message": answer,
+            "message": basic,
             "silent": False,
             "trace_id": trace_id,
-            "degraded": formulation_degraded,
+            "degraded": False,
         }
 
     degraded = False

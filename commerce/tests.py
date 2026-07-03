@@ -1080,28 +1080,23 @@ class MessageTurnTests(TestCase):
 
     @override_settings(KIMI_NATURAL_RESPONSES=True)
     @patch("commerce.views.KimiClient")
-    def test_kimi_can_naturalize_safe_response(self, kimi_class):
-        kimi_class.return_value.formulate.return_value = (
-            "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?"
-        )
+    def test_basic_greeting_never_waits_for_kimi(self, kimi_class):
         payload = self.post_message("bonjour").json()["data"]
         repeated = self.post_message("bonjour").json()["data"]
-        self.assertEqual(
-            payload["message"],
-            "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?",
-        )
+        self.assertIn("Bonjour", payload["message"])
         self.assertEqual(repeated["message"], payload["message"])
-        kimi_class.return_value.formulate.assert_called_once()
+        kimi_class.assert_not_called()
 
     @override_settings(KIMI_NATURAL_RESPONSES=True)
     @patch("commerce.views.KimiClient")
-    def test_formulation_error_never_breaks_business_response(self, kimi_class):
+    def test_basic_greeting_ignores_formulation_error(self, kimi_class):
         kimi_class.return_value.formulate.side_effect = ValueError("format error")
         response = self.post_message("bonjour")
         self.assertEqual(response.status_code, 200)
         payload = response.json()["data"]
         self.assertIn("Bonjour", payload["message"])
-        self.assertTrue(payload["degraded"])
+        self.assertFalse(payload["degraded"])
+        kimi_class.assert_not_called()
 
     def test_wolof_number_selection_is_not_treated_as_quantity(self):
         ConversationState.objects.create(
