@@ -32,6 +32,80 @@ Toutes les opérations utilisent `POST /api/commerce/` avec l'en-tête
 }
 ```
 
+### Contrat recommandé pour n8n et OpenWA
+
+Le workflow n8n principal utilise une seule action, `message_turn`. Django lit
+l'état persistant, comprend le français ou le wolof avec Kimi, exécute l'action
+WooCommerce et renvoie directement une réponse strictement en français.
+
+```json
+{
+  "action": "message_turn",
+  "data": {
+    "user_id": "221700000000",
+    "session_key": "openwa-session",
+    "message_id": "message-unique-id",
+    "timestamp": 1783012345000,
+    "message": "dama bëgg gis produits yi"
+  }
+}
+```
+
+La réponse contient `message`, `silent`, `trace_id`, l'analyse et le résultat
+métier. Quand un conseiller a pris la main, `silent` vaut `true` et n8n
+n'envoie aucun message automatique. Le workflow à importer est
+`n8n_ai_ecom_corrige.json` (Backend Unifié v13).
+
+### Contrat avancé `execute_intent`
+
+Le workflow conversationnel doit appeler une seule action metier, `execute_intent`.
+Kimi classe le message, tandis que Django valide les parametres, lit l'etat
+persistant et execute WooCommerce/PayTech.
+
+```json
+{
+  "action": "execute_intent",
+  "data": {
+    "user_id": "221700000000",
+    "session_key": "openwa-session",
+    "timestamp": "message-unique-id",
+    "idempotency_key": "221700000000:message-unique-id:search_products",
+    "intention": "search_products",
+    "params": {"query": "batterie"},
+    "confidence": 0.96,
+    "langue_detectee": "francais",
+    "reformulation": "Le client cherche une batterie."
+  }
+}
+```
+
+Intentions prises en charge : catalogue et produit, variantes, panier, commande,
+paiement, statut et suivi, annulation, remboursement, modification, coupon,
+politiques de la boutique et transfert humain.
+
+Les actions destructives ou financieres (`cart_clear`, `create_order`,
+`cancel_order`, `request_refund`, `update_order`) ne sont jamais executees au
+premier appel. L'API renvoie `requires_confirmation: true` et memorise l'action.
+Le tour suivant doit envoyer `confirm_action` pour executer ou
+`cancel_pending_action` pour abandonner :
+
+```json
+{
+  "action": "execute_intent",
+  "data": {
+    "user_id": "221700000000",
+    "intention": "confirm_action",
+    "params": {},
+    "confidence": 0.99
+  }
+}
+```
+
+Une confiance inferieure a `0.6` produit une clarification et aucun appel au
+fournisseur. Chaque reponse contient l'intention, les indicateurs
+`executed`/`requires_confirmation`/`requires_clarification`, le resultat et
+l'etat transactionnel courant.
+
 Pour `create_order`, la plateforme peut être indiquée une fois :
 
 ```json
@@ -90,6 +164,8 @@ Renseigner le vrai token dans `.env` :
 
 ```dotenv
 NGROK_AUTHTOKEN=votre_token_ngrok
+N8N_API_TOKEN=un-secret-long-et-aleatoire
+COMMERCE_API_URL=https://xxxx.ngrok-free.app/api/commerce/
 ```
 
 Puis lancer une seule commande depuis la racine du projet :
@@ -105,10 +181,26 @@ le port 8000, ouvre le tunnel ngrok, puis affiche une URL semblable à :
 https://xxxx.ngrok-free.app/api/commerce/
 ```
 
-Utiliser cette URL dans le nœud HTTP Request de n8n. Le tunnel et Django restent
-actifs tant que le terminal reste ouvert ; `Ctrl+C` arrête proprement les deux.
-Si Django est déjà actif sur le port 8000, le script le réutilise et ne l'arrête
-pas à la fermeture.
+Le domaine de `COMMERCE_API_URL` est demandé explicitement à ngrok afin que le
+workflow conserve une URL stable. Le script ferme les anciens processus de ce
+projet et les tunnels périmés avant chaque démarrage. Le tunnel et Django restent
+actifs tant que la fenêtre reste ouverte.
+
+Sous Windows, il est également possible de double-cliquer sur
+`DEMARRER_API.bat` sans utiliser le terminal.
+
+### Workflow n8n (Backend Unifié v13)
+
+Importer `n8n_ai_ecom_corrige.json` puis :
+
+1. Vérifier le credential existant **OpenWA account 2** sur `Send OpenWA`.
+2. Sauvegarder puis publier/activer le workflow.
+3. Démarrer l'API avec `DEMARRER_API.bat`.
+
+Le workflow ne contient plus Kimi ni la logique métier. Il transmet le message à
+`message_turn` et renvoie la réponse française fournie par Django. Le token API
+est intégré uniquement dans cette version de test et doit devenir un credential
+n8n avant la production.
 
 ## Vérification
 

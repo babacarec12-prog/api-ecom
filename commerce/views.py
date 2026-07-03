@@ -4,7 +4,9 @@ import hmac
 import json
 import logging
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
+from uuid import uuid4
 
 from django.conf import settings
 from django.core.cache import cache
@@ -15,6 +17,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .exceptions import CommerceError
+from .kimi_client import KimiClient
 from .models import (
     Cart,
     ConversationState,
@@ -39,6 +42,13 @@ STATE_SEQUENCE = [
     "completed",
 ]
 ALLOWED_STATES = set(STATE_SEQUENCE) | {"human_takeover"}
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def health(request):
+    """Sonde légère utilisée par Render, sans dépendance à WooCommerce."""
+    return Response({"status": "ok", "service": "ai-commerce-api"}, status=200)
 
 ALLOWED_ACTIONS = {
     "search_products",
@@ -66,7 +76,9 @@ ALLOWED_ACTIONS = {
     "transfer_to_human",
     "check_human_status",
     "get_policy",
+    "execute_intent",
     "conversation_turn",
+    "message_turn",
 }
 
 
@@ -140,6 +152,8 @@ def _state_payload(state):
         "pending_product_id": state.pending_product_id,
         "pending_order_id": state.pending_order_id,
         "pending_amount": str(state.pending_amount) if state.pending_amount is not None else None,
+        "pending_action": state.pending_action,
+        "has_pending_action": bool(state.pending_action),
     }
 
 
@@ -460,7 +474,7 @@ def _get_order_status(data):
     return woo.get_order_status(data["order_id"])
 
 
-def _cancel_order(data):
+def _cancel_order_unprotected(data):
     _required(data, "order_id", "user_id")
     reason = str(data.get("reason", "")).strip()
     if len(reason) > 500:
@@ -469,7 +483,7 @@ def _cancel_order(data):
     return woo.cancel_order(data["order_id"], reason, data["user_id"])
 
 
-def _request_refund(data):
+def _request_refund_unprotected(data):
     _required(data, "order_id", "user_id", "amount")
     amount = _decimal(data["amount"], "amount", positive=True)
     reason = str(data.get("reason", "")).strip()
@@ -479,7 +493,7 @@ def _request_refund(data):
     return woo.request_refund(data["order_id"], amount, reason)
 
 
-def _update_order(data):
+def _update_order_unprotected(data):
     _required(data, "order_id", "user_id", "line_items")
     if not isinstance(data["line_items"], list) or not data["line_items"]:
         raise CommerceError("line_items doit être une liste non vide.", 400)
@@ -496,6 +510,30 @@ def _update_order(data):
         cleaned.append({"id": line_id, "quantity": quantity})
     woo = _owned_order(data)
     return woo.update_order(data["order_id"], cleaned)
+
+
+def _optional_idempotent(action, data, callback):
+    if data.get("idempotency_key"):
+        return _idempotent(action, data, callback)
+    return callback()
+
+
+def _cancel_order(data):
+    return _optional_idempotent(
+        "cancel_order", data, lambda: _cancel_order_unprotected(data)
+    )
+
+
+def _request_refund(data):
+    return _optional_idempotent(
+        "request_refund", data, lambda: _request_refund_unprotected(data)
+    )
+
+
+def _update_order(data):
+    return _optional_idempotent(
+        "update_order", data, lambda: _update_order_unprotected(data)
+    )
 
 
 def _get_tracking(data):
@@ -708,6 +746,684 @@ def _conversation_turn(data):
     }
 
 
+KIMI_INTENTIONS = {
+    "search_products", "get_product", "cart_add", "cart_view", "cart_remove",
+    "cart_clear", "cart_update_quantity", "create_order", "generate_payment",
+    "get_order_status", "cancel_order", "request_refund", "update_order",
+    "get_tracking", "validate_coupon", "check_variant_stock", "get_policy",
+    "transfer_to_human", "other",
+}
+
+
+def _intent_clarification(intention, message):
+    return {
+        "executed": False,
+        "intention": intention,
+        "requires_clarification": True,
+        "clarification": message,
+    }
+
+
+def _dispatch_intent(data):
+    """Execute une intention classee par Kimi, sans analyser le message client."""
+    _required(data, "user_id", "intention")
+    user_id = str(data["user_id"])
+    intention = str(data["intention"]).strip()
+    params = data.get("params") or {}
+    if intention not in KIMI_INTENTIONS:
+        raise CommerceError("Intention Kimi non autorisee.", 400)
+    if not isinstance(params, dict):
+        raise CommerceError("Les parametres Kimi doivent etre un objet JSON.", 400)
+
+    state = _state(user_id)
+    if state.state == "human_takeover" and intention != "transfer_to_human":
+        return {
+            "executed": False,
+            "intention": intention,
+            "human_takeover": True,
+            "message": "Un conseiller humain prend deja en charge ce client.",
+        }
+    if intention == "other":
+        return {
+            "executed": False,
+            "intention": intention,
+            "reformulation": data.get("reformulation", ""),
+        }
+
+    payload = {key: value for key, value in params.items() if value not in (None, "")}
+    payload.update({"user_id": user_id, "platform": "woocommerce"})
+
+    if intention == "search_products":
+        payload["query"] = str(payload.get("query") or "*").strip()
+        payload["session_key"] = str(data.get("session_key") or "current")
+        result = _search(payload)
+    elif intention == "get_product":
+        if payload.get("position") is not None:
+            result = {"selected_product": _get_product_by_position(payload)}
+        elif payload.get("product_id"):
+            result = _get_product(payload)
+        else:
+            return _intent_clarification(intention, "Quel produit souhaitez-vous consulter ?")
+    elif intention == "cart_add":
+        product_id = payload.get("product_id") or state.pending_product_id
+        if not product_id and payload.get("position") is not None:
+            product_id = _get_product_by_position(payload)["product_id"]
+        if not product_id:
+            return _intent_clarification(intention, "Quel produit souhaitez-vous ajouter au panier ?")
+        product = WooCommerceClient().get_product(product_id)
+        if product.get("prix") in (None, ""):
+            raise CommerceError("Le prix de ce produit est indisponible.", 409)
+        result = _cart_add({
+            "user_id": user_id,
+            "product_id": product["id"],
+            "product_name": product.get("nom") or "Produit",
+            "quantity": payload.get("quantity", 1),
+            "price": product["prix"],
+            "platform": "woocommerce",
+        })
+    elif intention in {"cart_remove", "cart_update_quantity"}:
+        product_id = payload.get("product_id") or state.pending_product_id
+        if not product_id and payload.get("position") is not None:
+            product_id = _get_product_by_position(payload)["product_id"]
+        if not product_id:
+            return _intent_clarification(intention, "Quel produit du panier souhaitez-vous modifier ?")
+        payload["product_id"] = product_id
+        if intention == "cart_update_quantity" and payload.get("quantity") is None:
+            return _intent_clarification(intention, "Quelle quantite souhaitez-vous ?")
+        result = _cart_remove(payload) if intention == "cart_remove" else _cart_update_quantity(payload)
+    elif intention == "cart_view":
+        result = _cart_view(payload)
+    elif intention == "cart_clear":
+        result = _cart_clear(payload)
+    elif intention == "create_order":
+        cart = _cart_payload(user_id)
+        if not cart["items"]:
+            return _intent_clarification(intention, "Votre panier est vide. Ajoutez d'abord un produit.")
+        if state.state != "confirming":
+            state.previous_state, state.state = state.state, "confirming"
+            state.save()
+            return {
+                "executed": False,
+                "intention": intention,
+                "requires_confirmation": True,
+                "cart": cart,
+                "message": "Demander une confirmation explicite avant de creer la commande.",
+            }
+        payload["idempotency_key"] = str(data.get("idempotency_key") or f"{user_id}:{data.get('timestamp', 'intent')}:create_order")
+        result = _create_order(payload)
+    elif intention == "generate_payment":
+        payload["order_id"] = payload.get("order_id") or state.pending_order_id
+        payload["amount"] = payload.get("amount") or state.pending_amount
+        if not payload.get("order_id") or payload.get("amount") in (None, ""):
+            return _intent_clarification(intention, "Quelle commande souhaitez-vous payer ?")
+        payload["idempotency_key"] = str(data.get("idempotency_key") or f"{user_id}:{data.get('timestamp', 'intent')}:generate_payment")
+        result = _generate_payment(payload)
+    elif intention in {"get_order_status", "cancel_order", "get_tracking"}:
+        payload["order_id"] = payload.get("order_id") or state.pending_order_id
+        if not payload.get("order_id"):
+            return _intent_clarification(intention, "Quel est le numero de la commande concernee ?")
+        if intention == "cancel_order":
+            payload["idempotency_key"] = _intent_key(data, intention)
+        handler = {
+            "get_order_status": _get_order_status,
+            "cancel_order": _cancel_order,
+            "get_tracking": _get_tracking,
+        }[intention]
+        result = handler(payload)
+    elif intention == "request_refund":
+        payload["order_id"] = payload.get("order_id") or state.pending_order_id
+        payload["amount"] = payload.get("amount") or state.pending_amount
+        if not payload.get("order_id") or payload.get("amount") in (None, ""):
+            return _intent_clarification(intention, "Precisez la commande et le montant du remboursement.")
+        payload["idempotency_key"] = _intent_key(data, intention)
+        result = _request_refund(payload)
+    elif intention == "update_order":
+        if not payload.get("order_id") or not payload.get("line_items"):
+            return _intent_clarification(intention, "Precisez la commande et les articles a modifier.")
+        payload["idempotency_key"] = _intent_key(data, intention)
+        result = _update_order(payload)
+    elif intention == "validate_coupon":
+        if not payload.get("code"):
+            return _intent_clarification(intention, "Quel code promotionnel souhaitez-vous verifier ?")
+        result = _validate_coupon(payload)
+    elif intention == "check_variant_stock":
+        if not payload.get("product_id") or not payload.get("variant_id"):
+            return _intent_clarification(intention, "Quelle variante souhaitez-vous verifier ?")
+        result = _check_variant_stock(payload)
+    elif intention == "get_policy":
+        if not payload.get("policy_type"):
+            return _intent_clarification(intention, "Parlez-vous de livraison, de retour ou de remboursement ?")
+        result = _get_policy(payload)
+    elif intention == "transfer_to_human":
+        result = _transfer_to_human(payload)
+    else:
+        raise CommerceError("Cette intention n'est pas executable.", 400)
+
+    return {"executed": True, "intention": intention, "result": result}
+
+
+CONFIRMABLE_INTENTIONS = {
+    "cart_clear",
+    "create_order",
+    "cancel_order",
+    "request_refund",
+    "update_order",
+}
+
+INTENTION_ALIASES = {
+    "confirm": "confirm_action",
+    "confirmation": "confirm_action",
+    "yes": "confirm_action",
+    "deny": "cancel_pending_action",
+    "no": "cancel_pending_action",
+    "cancel_pending": "cancel_pending_action",
+}
+
+POLICY_ALIASES = {
+    "delivery": "delivery",
+    "livraison": "delivery",
+    "returns": "returns",
+    "return": "returns",
+    "retour": "returns",
+    "refund": "refund",
+    "remboursement": "refund",
+}
+
+
+def _intent_key(data, intention):
+    supplied = str(data.get("idempotency_key") or "").strip()
+    if supplied:
+        return supplied
+    timestamp = str(data.get("timestamp") or "intent")
+    return f"{data['user_id']}:{timestamp}:{intention}"
+
+
+def _latest_order_id(user_id, state):
+    if state.pending_order_id:
+        return str(state.pending_order_id)
+    row = UserOrder.objects.filter(user_id=str(user_id)).order_by("-created_at").first()
+    return row.order_id if row else None
+
+
+def _normalise_intent_params(intention, params, user_id, state):
+    payload = {
+        str(key): value
+        for key, value in params.items()
+        if value not in (None, "")
+    }
+    if "position" in payload:
+        try:
+            payload["position"] = int(payload["position"])
+        except (TypeError, ValueError) as exc:
+            raise CommerceError("La position doit etre un entier.", 400) from exc
+    if "quantity" in payload:
+        try:
+            payload["quantity"] = int(payload["quantity"])
+        except (TypeError, ValueError) as exc:
+            raise CommerceError("La quantite doit etre un entier.", 400) from exc
+    if payload.get("policy_type"):
+        policy = POLICY_ALIASES.get(str(payload["policy_type"]).strip().casefold())
+        if not policy:
+            raise CommerceError("policy_type doit valoir delivery, returns ou refund.", 400)
+        payload["policy_type"] = policy
+    if intention in {
+        "generate_payment", "get_order_status", "cancel_order", "request_refund",
+        "update_order", "get_tracking",
+    } and not payload.get("order_id"):
+        payload["order_id"] = _latest_order_id(user_id, state)
+    return payload
+
+
+def _pending_summary(intention, payload, user_id):
+    if intention == "create_order":
+        return {"cart": _cart_payload(user_id)}
+    if intention == "cart_clear":
+        return {"cart": _cart_payload(user_id)}
+    if intention == "cancel_order":
+        return {"order_id": payload.get("order_id"), "reason": payload.get("reason", "")}
+    if intention == "request_refund":
+        return {
+            "order_id": payload.get("order_id"),
+            "amount": str(payload.get("amount")),
+            "currency": "XOF",
+            "reason": payload.get("reason", ""),
+        }
+    return {"order_id": payload.get("order_id"), "line_items": payload.get("line_items", [])}
+
+
+def _stage_intent(data, intention, payload, state):
+    if intention == "create_order" and not _cart_payload(data["user_id"])["items"]:
+        return _intent_clarification(intention, "Votre panier est vide. Ajoutez d'abord un produit.")
+    if intention in {"cancel_order", "request_refund", "update_order"} and not payload.get("order_id"):
+        return _intent_clarification(intention, "Quel est le numero de la commande concernee ?")
+    if intention == "request_refund" and payload.get("amount") in (None, ""):
+        return _intent_clarification(intention, "Quel montant souhaitez-vous rembourser ?")
+    if intention == "update_order" and not payload.get("line_items"):
+        return _intent_clarification(intention, "Quels articles de la commande souhaitez-vous modifier ?")
+    if intention in {"cancel_order", "request_refund"} and len(str(payload.get("reason", "")).strip()) > 500:
+        raise CommerceError("Le motif ne doit pas depasser 500 caracteres.", 400)
+    if intention == "request_refund":
+        payload["amount"] = str(_decimal(payload["amount"], "amount", positive=True))
+    if intention == "update_order":
+        if not isinstance(payload["line_items"], list):
+            raise CommerceError("line_items doit etre une liste non vide.", 400)
+        for index, item in enumerate(payload["line_items"]):
+            if not isinstance(item, dict) or not item.get("line_item_id"):
+                raise CommerceError(f"La ligne {index + 1} doit contenir line_item_id.", 400)
+            try:
+                quantity = int(item.get("quantity"))
+                int(item["line_item_id"])
+            except (TypeError, ValueError) as exc:
+                raise CommerceError(f"Ligne ou quantite invalide a la position {index + 1}.", 400) from exc
+            if quantity < 0:
+                raise CommerceError("Une quantite ne peut pas etre negative.", 400)
+
+    stored = {
+        "params": payload,
+        "idempotency_key": _intent_key(data, intention),
+        "timestamp": data.get("timestamp"),
+        "state_before_confirmation": state.state,
+    }
+    if intention == "create_order" and state.state != "confirming":
+        state.previous_state, state.state = state.state, "confirming"
+    state.pending_action = intention
+    state.pending_payload = json.loads(json.dumps(stored, default=str))
+    state.save()
+    return {
+        "executed": False,
+        "intention": intention,
+        "requires_confirmation": True,
+        "confirmation": _pending_summary(intention, payload, data["user_id"]),
+        "message": "Une confirmation explicite est requise avant cette action.",
+        "state": _state_payload(state),
+    }
+
+
+def _cancel_pending_intent(user_id, state):
+    cancelled = state.pending_action
+    before = (state.pending_payload or {}).get("state_before_confirmation")
+    if cancelled == "create_order" and before in ALLOWED_STATES:
+        state.state = before
+    state.pending_action = None
+    state.pending_payload = {}
+    state.save()
+    return {
+        "executed": False,
+        "intention": "cancel_pending_action",
+        "cancelled_action": cancelled,
+        "state": _state_payload(state),
+    }
+
+
+def _confirm_pending_intent(data, state):
+    if not state.pending_action:
+        return _intent_clarification("confirm_action", "Aucune action n'attend de confirmation.")
+    pending_action = state.pending_action
+    stored = dict(state.pending_payload or {})
+    confirmed_data = {
+        **data,
+        "intention": pending_action,
+        "params": stored.get("params") or {},
+        "idempotency_key": stored.get("idempotency_key") or _intent_key(data, pending_action),
+        "timestamp": stored.get("timestamp") or data.get("timestamp"),
+        "confidence": 1,
+    }
+    result = _dispatch_intent(confirmed_data)
+    state.refresh_from_db()
+    state.pending_action = None
+    state.pending_payload = {}
+    state.save()
+    result["confirmed_action"] = pending_action
+    result["state"] = _state_payload(state)
+    return result
+
+
+def _execute_intent(data):
+    """Contrat transactionnel entre Kimi et l'API metier."""
+    _required(data, "user_id", "intention")
+    if not isinstance(data.get("params") or {}, dict):
+        raise CommerceError("Les parametres Kimi doivent etre un objet JSON.", 400)
+
+    intention = INTENTION_ALIASES.get(
+        str(data["intention"]).strip().casefold(),
+        str(data["intention"]).strip().casefold(),
+    )
+    allowed = KIMI_INTENTIONS | {"confirm_action", "cancel_pending_action"}
+    if intention not in allowed:
+        raise CommerceError("Intention Kimi non autorisee.", 400)
+
+    if data.get("confidence") not in (None, ""):
+        try:
+            confidence = float(data["confidence"])
+        except (TypeError, ValueError) as exc:
+            raise CommerceError("confidence doit etre un nombre entre 0 et 1.", 400) from exc
+        if not 0 <= confidence <= 1:
+            raise CommerceError("confidence doit etre un nombre entre 0 et 1.", 400)
+        if confidence < 0.6:
+            result = _intent_clarification(intention, "Pouvez-vous preciser votre demande ?")
+            result["state"] = _state_payload(_state(data["user_id"]))
+            return result
+
+    user_id = str(data["user_id"])
+    state = _state(user_id)
+    if state.state == "human_takeover" and intention != "transfer_to_human":
+        return {
+            "executed": False,
+            "intention": intention,
+            "human_takeover": True,
+            "message": "Un conseiller humain prend deja en charge ce client.",
+            "state": _state_payload(state),
+        }
+    if intention == "cancel_pending_action":
+        return _cancel_pending_intent(user_id, state)
+    if intention == "confirm_action":
+        return _confirm_pending_intent({**data, "user_id": user_id}, state)
+
+    params = _normalise_intent_params(intention, data.get("params") or {}, user_id, state)
+    normalised = {**data, "user_id": user_id, "intention": intention, "params": params}
+    if intention in CONFIRMABLE_INTENTIONS:
+        return _stage_intent(normalised, intention, params, state)
+
+    result = _dispatch_intent(normalised)
+    result.setdefault("requires_confirmation", False)
+    result.setdefault("requires_clarification", False)
+    result["state"] = _state_payload(_state(user_id))
+    return result
+
+
+def _normalise_message(value):
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(re.findall(r"[a-z0-9']+", text))
+
+
+AFFIRMATIVE_MESSAGES = {
+    "oui", "waw", "waaw", "yes", "ok", "d'accord", "d accord", "confirme",
+    "je confirme", "valide", "vas y",
+}
+NEGATIVE_MESSAGES = {
+    "non", "no", "deedeet", "annule", "laisse tomber", "du tout",
+}
+BASIC_FRENCH_RESPONSES = {
+    "bonjour": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "bonsoir": "Bonsoir ! Comment puis-je vous aider ? 😊",
+    "salut": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "hello": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "hi": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "coucou": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "cc": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "salam": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "asalaam maalekum": "Bonjour ! Comment puis-je vous aider ? 😊",
+    "nanga def": "Bonjour ! Je vais bien, merci. Comment puis-je vous aider ?",
+    "na nga def": "Bonjour ! Je vais bien, merci. Comment puis-je vous aider ?",
+    "merci": "Avec plaisir ! 😊",
+    "jerejef": "Avec plaisir ! 😊",
+}
+
+
+def _fallback_analysis(message, state):
+    """Secours local rapide quand Kimi est indisponible."""
+    normalized = _normalise_message(message)
+    params = {}
+    intention = "other"
+    commerce_words = re.search(
+        r"\b(catalogue|catalog|produit|produits|article|articles|montre|affiche|"
+        r"bissap|power bank|batterie|telephone|téléphone|chargeur|ordinateur|"
+        r"robe|chaussure|sac)\b",
+        normalized,
+    )
+    product_question = re.match(
+        r"^(?:amo|am nga|y a t il|avez vous|vous avez|dama beug|dama beg|je cherche|je veux|je voudrais)\b",
+        normalized,
+    )
+    if normalized.isdigit() and state.state == "selecting":
+        intention, params = "get_product", {"position": int(normalized)}
+    elif re.search(r"\b(voir|affiche|montre|consulte)\b.{0,20}\b(panier|cart)\b", normalized) or normalized in {"panier", "mon panier"}:
+        intention = "cart_view"
+    elif commerce_words or product_question:
+        intention = "search_products"
+        stop_words = {
+            "a", "affiche", "ai", "am", "amo", "avez", "beug", "beg", "catalog",
+            "catalogue", "dama", "de", "des", "du", "en", "est", "il", "je", "la",
+            "le", "les", "mes", "moi", "mon", "montre", "nga", "nos", "produit", "produits", "que",
+            "quoi", "t", "tes", "tous", "toutes", "un", "une", "voir", "votre", "vos", "voudrais",
+            "vous", "veux", "y", "yi", "disponible", "disponibles",
+        }
+        query_words = [word for word in normalized.split() if word not in stop_words]
+        params = {"query": " ".join(query_words) or "*"}
+    elif re.search(r"\b(conseiller|humain|agent|service client)\b", normalized):
+        intention, params = "transfer_to_human", {"reason": "Demande du client"}
+    return {
+        "intention": intention,
+        "params": params,
+        "confidence": 1 if intention != "other" else 0.8,
+        "langue_detectee": (
+            "wolof_mix"
+            if re.search(r"\b(dama|beug|beg|amo|nanga|nga|waw|waaw|jerejef|deedeet)\b", normalized)
+            else "français"
+        ),
+        "reformulation": str(message),
+        "reponse_generale": None,
+    }
+
+
+def _validated_message_analysis(raw, message, state):
+    raw = raw if isinstance(raw, dict) else {}
+    fallback = _fallback_analysis(message, state)
+    intention = str(raw.get("intention") or "").strip().casefold()
+    if intention not in KIMI_INTENTIONS:
+        return fallback
+    params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {
+        "intention": intention,
+        "params": params,
+        "confidence": confidence,
+        "langue_detectee": str(raw.get("langue_detectee") or "français"),
+        "reformulation": str(raw.get("reformulation") or message),
+        "reponse_generale": (
+            str(raw.get("reponse_generale") or "").strip() or None
+        ),
+    }
+
+
+def _apply_conversation_rules(analysis, message, state):
+    normalized = _normalise_message(message)
+    if state.pending_action and normalized in AFFIRMATIVE_MESSAGES:
+        return {**analysis, "intention": "confirm_action", "params": {}, "confidence": 1}
+    if state.pending_action and normalized in NEGATIVE_MESSAGES:
+        return {**analysis, "intention": "cancel_pending_action", "params": {}, "confidence": 1}
+    if not state.pending_action and state.pending_product_id and normalized in AFFIRMATIVE_MESSAGES:
+        return {**analysis, "intention": "cart_add", "params": {}, "confidence": 1}
+    if normalized.isdigit() and state.state == "selecting":
+        return {
+            **analysis,
+            "intention": "get_product",
+            "params": {"position": int(normalized)},
+            "confidence": 1,
+        }
+    return analysis
+
+
+def _display_price(value):
+    if value in (None, ""):
+        return ""
+    try:
+        return f" - {_money(value)} FCFA"
+    except CommerceError:
+        return ""
+
+
+def _format_french_message(analysis, commerce_result):
+    result = commerce_result.get("result") or {}
+    intention = commerce_result.get("intention") or analysis.get("intention")
+    if commerce_result.get("human_takeover"):
+        return None
+    if commerce_result.get("requires_clarification"):
+        return str(
+            commerce_result.get("clarification")
+            or "Pouvez-vous préciser votre demande ?"
+        )
+    if commerce_result.get("requires_confirmation"):
+        labels = {
+            "create_order": "créer la commande",
+            "cancel_order": "annuler la commande",
+            "request_refund": "enregistrer la demande de remboursement",
+            "update_order": "modifier la commande",
+            "cart_clear": "vider le panier",
+        }
+        summary = commerce_result.get("confirmation") or {}
+        prefix = ""
+        if isinstance(summary.get("cart"), dict) and summary["cart"].get("items"):
+            prefix = _format_cart(summary["cart"]) + "\n"
+        return (
+            prefix
+            + "Voulez-vous "
+            + labels.get(intention, "effectuer cette action")
+            + " ? Répondez oui pour confirmer ou non pour annuler."
+        )
+    if intention == "cancel_pending_action":
+        return "L'action en attente a été annulée."
+    if isinstance(result.get("products"), list):
+        products = result["products"][:10]
+        if not products:
+            return "Aucun produit correspondant n'a été trouvé."
+        lines = [
+            f"{index}. {item.get('nom') or item.get('product_name') or 'Produit'}"
+            f"{_display_price(item.get('prix', item.get('price')))}"
+            for index, item in enumerate(products, start=1)
+        ]
+        return "Voici les produits disponibles :\n" + "\n".join(lines) + "\nRépondez avec le numéro du produit choisi."
+    selected = result.get("selected_product")
+    if isinstance(selected, dict):
+        return (
+            f"{selected.get('product_name') or selected.get('nom') or 'Produit'}"
+            f"{_display_price(selected.get('price', selected.get('prix')))}\n"
+            "Souhaitez-vous l'ajouter au panier ?"
+        )
+    if isinstance(result.get("items"), list):
+        if not result["items"]:
+            return "Votre panier est vide."
+        return _format_cart(result)
+    if isinstance(result, dict) and result.get("nom"):
+        return f"{result['nom']}{_display_price(result.get('prix'))}"
+    if result.get("payment_url"):
+        return "Voici votre lien de paiement : " + str(result["payment_url"])
+    if result.get("statut"):
+        order = f" {result.get('order_id')}" if result.get("order_id") else ""
+        return f"Statut de la commande{order} : {str(result['statut']).replace('_', ' ')}."
+    if result.get("suivi_disponible") is True:
+        details = [result.get("transporteur"), result.get("numero_suivi"), result.get("url_suivi")]
+        return "Suivi de votre commande : " + " - ".join(str(value) for value in details if value)
+    if result.get("suivi_disponible") is False:
+        return "Aucune information de suivi n'est encore disponible pour cette commande."
+    if isinstance(result.get("valide"), bool):
+        return "Ce code promotionnel est valide." if result["valide"] else "Ce code promotionnel n'est pas valide."
+    if isinstance(result.get("en_stock"), bool):
+        return "Cette variante est disponible." if result["en_stock"] else "Cette variante est actuellement indisponible."
+    if result.get("content"):
+        return str(result["content"])
+    if result.get("human_takeover"):
+        return "Votre demande a été transmise à un conseiller."
+    if commerce_result.get("executed") and result.get("order_id"):
+        return f"La demande concernant la commande {result['order_id']} a bien été traitée."
+    if commerce_result.get("executed"):
+        return "Votre demande a bien été traitée."
+    if intention == "other":
+        return analysis.get("reponse_generale") or (
+            "Je peux vous renseigner sur nos produits, votre panier, une commande, "
+            "la livraison ou un remboursement."
+        )
+    return "Je n'ai pas bien compris votre demande. Pouvez-vous la préciser en quelques mots ?"
+
+
+def _message_turn(data):
+    """Traite un message complet et renvoie directement la réponse WhatsApp."""
+    _required(data, "user_id", "message")
+    user_id = str(data["user_id"])
+    message = " ".join(str(data["message"]).strip().split())
+    trace_id = str(data.get("message_id") or uuid4().hex)
+    state = _state(user_id)
+    if state.state == "human_takeover":
+        return {"message": None, "silent": True, "trace_id": trace_id}
+    if message in {"", "[MESSAGE_VIDE]"}:
+        return {
+            "message": "Pouvez-vous préciser votre demande ?",
+            "silent": False,
+            "trace_id": trace_id,
+        }
+    if message == "[MEDIA_SANS_TEXTE]":
+        return {
+            "message": "Décrivez-moi votre demande par écrit afin que je puisse vous aider.",
+            "silent": False,
+            "trace_id": trace_id,
+        }
+    basic = BASIC_FRENCH_RESPONSES.get(_normalise_message(message))
+    if basic:
+        return {"message": basic, "silent": False, "trace_id": trace_id}
+
+    degraded = False
+    local_analysis = _fallback_analysis(message, state)
+    if local_analysis["intention"] != "other":
+        # Les demandes fréquentes restent instantanées et continuent à marcher
+        # même lorsque Moonshot est ralenti ou indisponible.
+        analysis = local_analysis
+    else:
+        try:
+            raw_analysis = KimiClient().classify(message, _state_payload(state))
+            analysis = _validated_message_analysis(raw_analysis, message, state)
+        except CommerceError as exc:
+            degraded = True
+            logger.warning("Kimi indisponible pour message_turn trace=%s: %s", trace_id, exc.message)
+            analysis = local_analysis
+    analysis = _apply_conversation_rules(analysis, message, state)
+
+    intent_data = {
+        "user_id": user_id,
+        "session_key": str(data.get("session_key") or "current"),
+        "timestamp": data.get("timestamp"),
+        "idempotency_key": f"{user_id}:{trace_id}:{analysis['intention']}",
+        **analysis,
+    }
+    try:
+        commerce_result = _execute_intent(intent_data)
+    except CommerceError as exc:
+        logger.warning(
+            "Commerce indisponible pour message_turn trace=%s intention=%s statut=%s: %s",
+            trace_id,
+            analysis["intention"],
+            exc.status_code,
+            exc.message,
+        )
+        return {
+            "message": "Le service boutique est momentanément indisponible. Réessayez dans quelques instants.",
+            "silent": False,
+            "trace_id": trace_id,
+            "degraded": True,
+            "error_type": "commerce_unavailable",
+        }
+    answer = _format_french_message(analysis, commerce_result)
+    silent = answer is None
+    logger.info(
+        "message_turn terminé trace=%s intention=%s degraded=%s silent=%s",
+        trace_id,
+        analysis["intention"],
+        degraded,
+        silent,
+    )
+    return {
+        "message": answer,
+        "silent": silent,
+        "trace_id": trace_id,
+        "degraded": degraded,
+        "analysis": analysis,
+        "commerce": commerce_result,
+    }
+
+
 HANDLERS = {
     "search_products": _search,
     "get_product": _get_product,
@@ -734,7 +1450,9 @@ HANDLERS = {
     "transfer_to_human": _transfer_to_human,
     "check_human_status": _check_human_status,
     "get_policy": _get_policy,
+    "execute_intent": _execute_intent,
     "conversation_turn": _conversation_turn,
+    "message_turn": _message_turn,
 }
 
 

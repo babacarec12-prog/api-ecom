@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -16,8 +17,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 
-DEFAULT_URL = "https://scavenger-babied-tingly.ngrok-free.dev/api/commerce/"
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+DEFAULT_URL = os.getenv(
+    "COMMERCE_API_URL", "http://127.0.0.1:8000/api/commerce/"
+).strip()
+DEFAULT_API_TOKEN = os.getenv("N8N_API_TOKEN", "").strip()
 
 
 @dataclass
@@ -31,17 +38,24 @@ class Result:
 
 
 class CommerceTester:
-    def __init__(self, url: str, timeout: int) -> None:
+    def __init__(self, url: str, timeout: int, api_token: str = "") -> None:
         self.url = url
         self.timeout = timeout
+        self.api_token = api_token
         self.results: list[Result] = []
 
     def call(self, action: str, data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         payload = json.dumps({"action": action, "data": data}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "commerce-mvp-tester/1.0",
+        }
+        if self.api_token:
+            headers["X-API-Token"] = self.api_token
         request = urllib.request.Request(
             self.url,
             data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "commerce-mvp-tester/1.0"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -119,6 +133,11 @@ def products_from(response: dict[str, Any] | None) -> list[dict[str, Any]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Teste les 11 actions de /api/commerce/.")
     parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument(
+        "--api-token",
+        default=DEFAULT_API_TOKEN,
+        help="Valeur du header X-API-Token (par défaut : N8N_API_TOKEN du .env)",
+    )
     parser.add_argument("--query", default="bissap")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--report", default="test-report.md")
@@ -148,7 +167,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tester = CommerceTester(args.url, args.timeout)
+    tester = CommerceTester(args.url, args.timeout, args.api_token)
 
     search = tester.run("search_products", {"query": args.query})
     products = products_from(search)

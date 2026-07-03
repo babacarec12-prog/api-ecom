@@ -39,8 +39,16 @@ CREATE TABLE IF NOT EXISTS conversation_states (
     pending_product_id VARCHAR(50),
     pending_order_id VARCHAR(50),
     pending_amount DECIMAL(10,2),
+    pending_action VARCHAR(50),
+    pending_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Mise a niveau sure d'une base deja creee par une version precedente.
+ALTER TABLE conversation_states
+    ADD COLUMN IF NOT EXISTS pending_action VARCHAR(50);
+ALTER TABLE conversation_states
+    ADD COLUMN IF NOT EXISTS pending_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS processed_requests (
     id BIGSERIAL PRIMARY KEY,
@@ -81,5 +89,19 @@ INSERT INTO shop_policies (policy_type, content) VALUES
     ('refund', 'Remboursement sous 5-7 jours ouvrés après réception du retour.')
 ON CONFLICT (policy_type) DO UPDATE
 SET content = EXCLUDED.content, updated_at = NOW();
+
+-- Valeurs par defaut adaptees a une boutique senegalaise.
+UPDATE shop_policies SET content =
+    'Livraison sous 3 à 5 jours ouvrés. Les frais et le délai exact sont confirmés selon la zone de livraison au Sénégal.',
+    updated_at = NOW()
+WHERE policy_type = 'delivery';
+UPDATE shop_policies SET content =
+    'Retours acceptés sous 14 jours pour un produit non utilisé, complet et dans son emballage d''origine.',
+    updated_at = NOW()
+WHERE policy_type = 'returns';
+UPDATE shop_policies SET content =
+    'Après validation du retour, le remboursement est enregistré puis traité selon le moyen de paiement utilisé.',
+    updated_at = NOW()
+WHERE policy_type = 'refund';
 
 COMMIT;

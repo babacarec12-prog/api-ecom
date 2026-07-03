@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,6 +69,41 @@ def port_is_open() -> bool:
         return False
 
 
+def stop_existing_project_server() -> None:
+    """Ferme seulement un ancien runserver appartenant à ce projet Windows."""
+    if not port_is_open():
+        return
+    if os.name != "nt":
+        raise RuntimeError(
+            f"Le port {PORT} est déjà utilisé. Arrêtez l'ancien serveur avant de continuer."
+        )
+    project = str(BASE_DIR).replace("'", "''")
+    script = f"""
+$connections = Get-NetTCPConnection -LocalPort {PORT} -State Listen -ErrorAction SilentlyContinue
+foreach ($connection in $connections) {{
+  $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)" -ErrorAction SilentlyContinue
+  if ($process.CommandLine -like '*{project}*' -and $process.CommandLine -like '*manage.py*runserver*') {{
+    Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue
+  }}
+}}
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        cwd=BASE_DIR,
+        timeout=15,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5
+    while port_is_open() and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if port_is_open():
+        raise RuntimeError(
+            f"Le port {PORT} est utilisé par une autre application. Fermez-la puis relancez."
+        )
+
+
 def stop_process(process: subprocess.Popen | None) -> None:
     """Arrête proprement le serveur Django, puis force si nécessaire."""
     if process is None or process.poll() is not None:
@@ -95,6 +131,10 @@ def main() -> int:
             "par votre vrai token ngrok."
         )
         return 1
+    configured_api_url = os.getenv("COMMERCE_API_URL", "").strip()
+    configured_domain = urlparse(configured_api_url).hostname if configured_api_url else None
+    if configured_domain and "ngrok" not in configured_domain:
+        configured_domain = None
 
     # Le domaine public doit être autorisé par Django sans ouvrir ALLOWED_HOSTS à '*'.
     current_hosts = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
@@ -108,27 +148,39 @@ def main() -> int:
     django_process = None
     public_url = None
     try:
-        if port_is_open():
-            print(f"[django] Un serveur est déjà actif sur {LOCAL_URL} ; réutilisation.")
-        else:
-            print(f"[django] Démarrage sur {LOCAL_URL}...")
-            django_process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(BASE_DIR / "manage.py"),
-                    "runserver",
-                    f"127.0.0.1:{PORT}",
-                    "--noreload",
-                ],
-                cwd=BASE_DIR,
-            )
-            wait_for_django(django_process)
-            print("[django] Prêt.")
+        stop_existing_project_server()
+        print(f"[django] Démarrage sur {LOCAL_URL}...")
+        django_process = subprocess.Popen(
+            [
+                sys.executable,
+                str(BASE_DIR / "manage.py"),
+                "runserver",
+                f"127.0.0.1:{PORT}",
+                "--noreload",
+            ],
+            cwd=BASE_DIR,
+        )
+        wait_for_django(django_process)
+        print("[django] Prêt.")
 
         print("[ngrok] Configuration et ouverture du tunnel...")
         ngrok.set_auth_token(token)
-        tunnel = ngrok.connect(addr=PORT, proto="http")
+        # Toujours recréer le tunnel : une URL encore visible sur le port 4040
+        # peut appartenir à un agent dont le heartbeat est déjà mort.
+        try:
+            ngrok.kill()
+        except Exception:
+            pass
+        connect_options = {"addr": PORT, "proto": "http"}
+        if configured_domain:
+            connect_options["domain"] = configured_domain
+        tunnel = ngrok.connect(**connect_options)
         public_url = tunnel.public_url.rstrip("/")
+
+        if configured_domain and urlparse(public_url).hostname != configured_domain:
+            raise RuntimeError(
+                "Le tunnel ngrok n'utilise pas le domaine stable configuré dans COMMERCE_API_URL."
+            )
 
         print("\n" + "=" * 68)
         print(f"API PUBLIQUE : {public_url}/api/commerce/")
@@ -140,8 +192,6 @@ def main() -> int:
         while True:
             if django_process is not None and django_process.poll() is not None:
                 raise RuntimeError(f"Django s'est arrêté (code {django_process.returncode}).")
-            if django_process is None and not port_is_open():
-                raise RuntimeError("Le serveur déjà présent sur le port 8000 s'est arrêté.")
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[arrêt] Fermeture de Django et ngrok...")

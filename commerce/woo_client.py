@@ -1,10 +1,12 @@
 """Client minimal pour l'API REST WooCommerce."""
 from difflib import SequenceMatcher
+import hashlib
 import os
 import re
 import unicodedata
 
 import requests
+from django.core.cache import cache
 
 from .exceptions import CommerceError
 
@@ -136,19 +138,30 @@ class WooCommerceClient:
 
     def search_products(self, query):
         query = str(query or "").strip()
+        cache_key = "woo:products:" + hashlib.sha256(
+            self._normalize(query).encode("utf-8")
+        ).hexdigest()
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         # L'astérisque permet à l'agent de demander explicitement le catalogue.
         if query == "*":
             products = self._request("GET", "products", params={"per_page": 100})
-            return self._format_products(products)
+            formatted = self._format_products(products)
+            cache.set(cache_key, formatted, timeout=60)
+            return formatted
 
         products = self._request(
             "GET", "products", params={"search": query, "per_page": 50}
         )
         if products:
-            return self._format_products(products)
+            formatted = self._format_products(products)
+            cache.set(cache_key, formatted, timeout=60)
+            return formatted
 
         if not self._can_use_fuzzy_fallback(query):
+            cache.set(cache_key, [], timeout=30)
             return []
 
         # WooCommerce ne corrige pas les fautes de frappe. En cas de recherche
@@ -159,7 +172,9 @@ class WooCommerceClient:
         ]
         matches = [item for item in matches if item[0] >= 0.72]
         matches.sort(key=lambda item: item[0], reverse=True)
-        return self._format_products([product for _, product in matches[:50]])
+        formatted = self._format_products([product for _, product in matches[:50]])
+        cache.set(cache_key, formatted, timeout=60)
+        return formatted
 
     def get_product(self, product_id):
         product = self._request("GET", f"products/{product_id}")

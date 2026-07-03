@@ -23,6 +23,11 @@ class CommerceEndpointTests(SimpleTestCase):
     def setUp(self):
         self.client = APIClient()
 
+    def test_health_endpoint_is_public(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+
     @patch("commerce.views.HANDLERS")
     def test_success_response_contract(self, handlers):
         handlers.__getitem__.return_value = lambda data: {"products": []}
@@ -560,6 +565,182 @@ class PersistentCommerceActionsTests(TestCase):
         self.assertEqual(Cart.objects.get(user_id=self.user_id).product_id, "10")
         self.assertEqual(ConversationState.objects.get(user_id=self.user_id).state, "cart_review")
 
+    @patch("commerce.views.WooCommerceClient")
+    def test_execute_intent_uses_kimi_intention_without_raw_message(self, woo_class):
+        woo_class.return_value.search_products.return_value = [
+            {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 13}
+        ]
+        response = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "session_key": "kimi-session",
+                "intention": "search_products",
+                "params": {"query": "batterie"},
+                "confidence": 0.98,
+                "reformulation": "Le client cherche une batterie.",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["data"]["executed"])
+        woo_class.return_value.search_products.assert_called_once_with("batterie")
+        self.assertEqual(ProductSelection.objects.get(user_id=self.user_id).product_id, "10")
+
+    def test_execute_intent_rejects_unknown_kimi_intention(self):
+        response = self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "delete_everything", "params": {}},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["success"])
+
+    @patch("commerce.views.WooCommerceClient")
+    def test_execute_intent_stages_and_confirms_order(self, woo_class):
+        woo_class.return_value.create_order.return_value = {
+            "order_id": "88",
+            "montant_total": "5000",
+            "devise": "XOF",
+            "plateforme": "woocommerce",
+        }
+        Cart.objects.create(
+            user_id=self.user_id,
+            product_id="18",
+            product_name="Bissap",
+            quantity=2,
+            price="2500",
+        )
+        staged = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "create_order",
+                "params": {},
+                "confidence": 0.99,
+                "timestamp": "turn-1",
+            },
+        )
+        self.assertFalse(staged.json()["data"]["executed"])
+        self.assertTrue(staged.json()["data"]["requires_confirmation"])
+        state = ConversationState.objects.get(user_id=self.user_id)
+        self.assertEqual(state.pending_action, "create_order")
+        self.assertEqual(state.state, "confirming")
+        woo_class.return_value.create_order.assert_not_called()
+
+        confirmed = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "confirm_action",
+                "params": {},
+                "confidence": 0.99,
+            },
+        )
+        self.assertTrue(confirmed.json()["data"]["executed"])
+        self.assertEqual(confirmed.json()["data"]["confirmed_action"], "create_order")
+        self.assertEqual(confirmed.json()["data"]["result"]["order_id"], "88")
+        state.refresh_from_db()
+        self.assertIsNone(state.pending_action)
+        self.assertEqual(state.pending_order_id, "88")
+
+    @patch("commerce.views.WooCommerceClient")
+    def test_sensitive_order_actions_wait_for_confirmation(self, woo_class):
+        UserOrder.objects.create(user_id=self.user_id, order_id="77")
+        ConversationState.objects.create(
+            user_id=self.user_id,
+            state="ordering",
+            previous_state="confirming",
+            pending_order_id="77",
+            pending_amount="2500",
+        )
+        woo_class.return_value.cancel_order.return_value = {
+            "order_id": "77", "statut": "annulee", "plateforme": "woocommerce"
+        }
+        staged = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "cancel_order",
+                "params": {"reason": "Erreur client"},
+                "timestamp": "turn-2",
+            },
+        )
+        self.assertTrue(staged.json()["data"]["requires_confirmation"])
+        self.assertEqual(staged.json()["data"]["confirmation"]["order_id"], "77")
+        woo_class.return_value.cancel_order.assert_not_called()
+        confirmed = self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "confirm", "params": {}},
+        )
+        self.assertTrue(confirmed.json()["data"]["executed"])
+        woo_class.return_value.cancel_order.assert_called_once_with(
+            "77", "Erreur client", self.user_id
+        )
+
+    def test_pending_action_can_be_refused(self):
+        Cart.objects.create(
+            user_id=self.user_id,
+            product_id="18",
+            product_name="Bissap",
+            quantity=1,
+            price="2500",
+        )
+        self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "create_order", "params": {}},
+        )
+        refused = self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "cancel_pending_action", "params": {}},
+        )
+        self.assertEqual(refused.json()["data"]["cancelled_action"], "create_order")
+        state = ConversationState.objects.get(user_id=self.user_id)
+        self.assertIsNone(state.pending_action)
+        self.assertEqual(state.state, "browsing")
+
+    @patch("commerce.views.WooCommerceClient")
+    def test_low_confidence_never_calls_commerce_provider(self, woo_class):
+        response = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "search_products",
+                "params": {"query": "telephone"},
+                "confidence": 0.2,
+            },
+        )
+        self.assertTrue(response.json()["data"]["requires_clarification"])
+        woo_class.assert_not_called()
+
+    @patch("commerce.views.WooCommerceClient")
+    def test_coupon_variant_and_policy_parameters_are_executable(self, woo_class):
+        woo_class.return_value.validate_coupon.return_value = {"code": "PROMO", "valide": True}
+        woo_class.return_value.check_variant_stock.return_value = {
+            "product_id": "10", "variant_id": "11", "en_stock": True
+        }
+        coupon = self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "validate_coupon", "params": {"code": "PROMO"}},
+        )
+        variant = self.post(
+            "execute_intent",
+            {
+                "user_id": self.user_id,
+                "intention": "check_variant_stock",
+                "params": {"product_id": "10", "variant_id": "11"},
+            },
+        )
+        ShopPolicy.objects.update_or_create(
+            policy_type="delivery", defaults={"content": "Livraison sous 48 h"}
+        )
+        policy = self.post(
+            "execute_intent",
+            {"user_id": self.user_id, "intention": "get_policy", "params": {"policy_type": "livraison"}},
+        )
+        self.assertTrue(coupon.json()["data"]["executed"])
+        self.assertTrue(variant.json()["data"]["result"]["en_stock"])
+        self.assertEqual(policy.json()["data"]["result"]["policy_type"], "delivery")
+
     def test_state_progression_and_revert(self):
         initial = self.post("get_state", {"user_id": self.user_id})
         self.assertEqual(initial.json()["data"]["state"], "browsing")
@@ -676,6 +857,93 @@ class PersistentCommerceActionsTests(TestCase):
         )
 
 
+class MessageTurnTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.user_id = "221700000099"
+
+    def post_message(self, message, **extra):
+        return self.client.post(
+            "/api/commerce/",
+            {
+                "action": "message_turn",
+                "data": {
+                    "user_id": self.user_id,
+                    "session_key": "whatsapp-test",
+                    "message_id": "message-1",
+                    "message": message,
+                    **extra,
+                },
+            },
+            format="json",
+        )
+
+    @patch("commerce.views.KimiClient")
+    def test_basic_greeting_is_immediate_and_french(self, kimi_class):
+        response = self.post_message("nanga def")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["data"]
+        self.assertIn("Bonjour", payload["message"])
+        self.assertFalse(payload["silent"])
+        self.assertEqual(payload["trace_id"], "message-1")
+        kimi_class.assert_not_called()
+
+    @patch("commerce.views.WooCommerceClient")
+    @patch("commerce.views.KimiClient")
+    def test_wolof_is_understood_but_answer_is_french(self, kimi_class, woo_class):
+        kimi_class.return_value.classify.return_value = {
+            "intention": "search_products",
+            "params": {"query": "bissap"},
+            "confidence": 0.97,
+            "langue_detectee": "wolof_mix",
+            "reformulation": "Le client cherche du bissap.",
+        }
+        woo_class.return_value.search_products.return_value = [
+            {"id": "18", "nom": "Bissap naturel", "prix": "2500", "stock": 10}
+        ]
+        payload = self.post_message("dama bëgg bissap").json()["data"]
+        self.assertIn("Voici les produits disponibles", payload["message"])
+        self.assertIn("Bissap naturel", payload["message"])
+        self.assertNotIn("dama", payload["message"].casefold())
+        self.assertEqual(payload["analysis"]["langue_detectee"], "wolof_mix")
+
+    @patch("commerce.views.WooCommerceClient")
+    @patch("commerce.views.KimiClient")
+    def test_catalogue_uses_fast_local_path_without_kimi(self, kimi_class, woo_class):
+        kimi_class.return_value.classify.side_effect = CommerceError("Kimi indisponible", 502)
+        woo_class.return_value.search_products.return_value = [
+            {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 3}
+        ]
+        payload = self.post_message("montre moi les produits").json()["data"]
+        self.assertFalse(payload["degraded"])
+        self.assertIn("Batterie externe", payload["message"])
+        kimi_class.assert_not_called()
+        woo_class.return_value.search_products.assert_called_once_with("*")
+
+    @patch("commerce.views.KimiClient")
+    def test_general_kimi_reply_is_forwarded_in_french(self, kimi_class):
+        kimi_class.return_value.classify.return_value = {
+            "intention": "other",
+            "params": {},
+            "confidence": 0.9,
+            "langue_detectee": "wolof_mix",
+            "reformulation": "Le client demande comment ça va.",
+            "reponse_generale": "Je vais très bien, merci ! Comment puis-je vous aider ?",
+        }
+        payload = self.post_message("naka nga def tey").json()["data"]
+        self.assertEqual(
+            payload["message"],
+            "Je vais très bien, merci ! Comment puis-je vous aider ?",
+        )
+
+    def test_human_takeover_keeps_the_bot_silent(self):
+        ConversationState.objects.create(user_id=self.user_id, state="human_takeover")
+        payload = self.post_message("bonjour").json()["data"]
+        self.assertTrue(payload["silent"])
+        self.assertIsNone(payload["message"])
+
+
 class CommerceSecurityTests(TestCase):
     def setUp(self):
         cache.clear()
@@ -695,7 +963,7 @@ class CommerceSecurityTests(TestCase):
         )
         self.assertEqual(allowed.status_code, 200)
 
-    @override_settings(COMMERCE_RATE_LIMIT=2)
+    @override_settings(N8N_API_TOKEN="", COMMERCE_RATE_LIMIT=2)
     def test_rate_limit_returns_429(self):
         for _ in range(2):
             response = self.client.post(

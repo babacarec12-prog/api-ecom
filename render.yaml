@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: ai-commerce-api-babacare
+    runtime: python
+    plan: free
+    region: frankfurt
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python manage.py migrate --noinput && gunicorn ai_commerce.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --access-logfile -
+    healthCheckPath: /api/health/
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "False"
+      - key: DJANGO_ALLOWED_HOSTS
+        value: .onrender.com
+      - key: DJANGO_SECURE_SSL_REDIRECT
+        value: "True"
+      - key: DJANGO_SECURE_HSTS_SECONDS
+        value: "31536000"
+      - key: COMMERCE_USE_SQLITE
+        value: "False"
+      - key: DB_PORT
+        value: "6543"
+      - key: DB_SSLMODE
+        value: require
+      - key: DB_CONN_MAX_AGE
+        value: "60"
+      - key: COMMERCE_RATE_LIMIT
+        value: "120"
+      - key: KIMI_MODEL
+        value: moonshot-v1-8k
+      - key: KIMI_TIMEOUT
+        value: "12"
+      - key: WOO_VERIFY_SSL
+        value: "True"
+      - key: DATABASE_URL
+        sync: false
+      - key: N8N_API_TOKEN
+        sync: false
+      - key: KIMI_API_KEY
+        sync: false
+      - key: WOO_STORE_URL
+        sync: false
+      - key: WOO_CONSUMER_KEY
+        sync: false
+      - key: WOO_CONSUMER_SECRET
+        sync: false
