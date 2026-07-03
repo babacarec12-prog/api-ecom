@@ -35,6 +35,15 @@ Schéma exact :
 "reponse_generale":"réponse courte en français uniquement si intention=other, sinon null"}
 """
 
+FORMULATION_PROMPT = """Tu es l'assistant WhatsApp naturel d'une boutique au Sénégal.
+Réponds strictement en français, même si le client écrit en wolof. Utilise un
+ton chaleureux, humain et concis. Les données métier et la réponse sûre fournies
+sont la seule vérité : ne change aucun produit, prix, quantité, total, numéro de
+commande ou état. N'ajoute aucune information commerciale. Pour une liste,
+conserve toutes les lignes et tous les montants. Sans Markdown ni astérisques.
+Retourne uniquement le message final destiné au client.
+"""
+
 
 class KimiClient:
     """Appelle l'API compatible OpenAI de Moonshot sans exposer sa clé."""
@@ -48,7 +57,7 @@ class KimiClient:
         if not self.api_key:
             raise CommerceError("Le service de compréhension n'est pas configuré.", 503)
 
-    def classify(self, message, state):
+    def _completion(self, messages, *, temperature, max_tokens):
         try:
             response = requests.post(
                 "https://api.moonshot.ai/v1/chat/completions",
@@ -58,33 +67,40 @@ class KimiClient:
                 },
                 json={
                     "model": self.model,
-                    "temperature": 0.1,
-                    "max_tokens": 400,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": (
-                                "État commerce : "
-                                + json.dumps(state, ensure_ascii=False, default=str)
-                                + "\nMessage client : "
-                                + str(message)
-                            ),
-                        },
-                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "messages": messages,
                 },
                 timeout=(3, self.timeout),
             )
         except requests.RequestException as exc:
-            raise CommerceError("Le service de compréhension est temporairement indisponible.", 502) from exc
+            raise CommerceError("Le service Kimi est temporairement indisponible.", 502) from exc
 
         if not response.ok:
-            raise CommerceError("Le service de compréhension a refusé la requête.", 502)
+            raise CommerceError("Le service Kimi a refusé la requête.", 502)
         try:
             body = response.json()
-            raw = str(body["choices"][0]["message"]["content"] or "").strip()
+            return str(body["choices"][0]["message"]["content"] or "").strip()
         except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise CommerceError("Le service de compréhension a renvoyé une réponse invalide.", 502) from exc
+            raise CommerceError("Le service Kimi a renvoyé une réponse invalide.", 502) from exc
+
+    def classify(self, message, state):
+        raw = self._completion(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "État commerce : "
+                        + json.dumps(state, ensure_ascii=False, default=str)
+                        + "\nMessage client : "
+                        + str(message)
+                    ),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=400,
+        )
 
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
         start, end = raw.find("{"), raw.rfind("}")
@@ -95,3 +111,36 @@ class KimiClient:
         if not isinstance(parsed, dict):
             raise CommerceError("Le service de compréhension a renvoyé une réponse invalide.", 502)
         return parsed
+
+    def formulate(self, message, analysis, commerce_result, safe_answer):
+        raw = self._completion(
+            [
+                {"role": "system", "content": FORMULATION_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Message client : " + str(message)
+                        + "\nIntention : " + json.dumps(analysis, ensure_ascii=False, default=str)
+                        + "\nRésultat métier : " + json.dumps(commerce_result, ensure_ascii=False, default=str)
+                        + "\nRéponse sûre à reformuler : " + str(safe_answer)
+                    ),
+                },
+            ],
+            temperature=0.55,
+            max_tokens=700,
+        )
+        answer = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE)
+        answer = answer.replace("**", "").strip()
+        if not answer:
+            raise CommerceError("Kimi n'a produit aucune réponse.", 502)
+        forbidden_wolof = re.search(
+            r"\b(nanga|dama|sama|danga|waaw|waw|jerejef|inshallah|deedeet)\b",
+            answer.casefold(),
+        )
+        if forbidden_wolof:
+            raise CommerceError("Kimi n'a pas répondu strictement en français.", 502)
+        safe_numbers = re.findall(r"\d+", str(safe_answer))
+        answer_numbers = re.findall(r"\d+", answer)
+        if any(number not in answer_numbers for number in safe_numbers):
+            raise CommerceError("Kimi a modifié une donnée commerciale.", 502)
+        return answer

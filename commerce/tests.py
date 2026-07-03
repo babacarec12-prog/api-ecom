@@ -980,6 +980,36 @@ class MessageTurnTests(TestCase):
         self.assertEqual(payload["trace_id"], "message-1")
         kimi_class.assert_not_called()
 
+    @override_settings(KIMI_NATURAL_RESPONSES=True)
+    @patch("commerce.views.KimiClient")
+    def test_kimi_can_naturalize_safe_response(self, kimi_class):
+        kimi_class.return_value.formulate.return_value = (
+            "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?"
+        )
+        payload = self.post_message("bonjour").json()["data"]
+        self.assertEqual(
+            payload["message"],
+            "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?",
+        )
+        kimi_class.return_value.formulate.assert_called_once()
+
+    def test_wolof_number_selection_is_not_treated_as_quantity(self):
+        ConversationState.objects.create(
+            user_id=self.user_id, state="selecting", previous_state="browsing"
+        )
+        ProductSelection.objects.create(
+            user_id=self.user_id,
+            session_key="whatsapp-test",
+            position=5,
+            product_id="DB-005",
+            product_name="T-shirt coton Sénégal",
+            price="7500",
+        )
+        payload = self.post_message("5 bi nekh nama").json()["data"]
+        self.assertEqual(payload["analysis"]["intention"], "get_product")
+        self.assertEqual(payload["analysis"]["params"], {"position": 5})
+        self.assertIn("T-shirt coton Sénégal", payload["message"])
+
     @patch("commerce.views.WooCommerceClient")
     @patch("commerce.views.KimiClient")
     def test_wolof_is_understood_but_answer_is_french(self, kimi_class, woo_class):

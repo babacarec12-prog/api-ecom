@@ -1216,8 +1216,22 @@ def _fallback_analysis(message, state):
         r"^(?:amo|am nga|y a t il|avez vous|vous avez|dama beug|dama beg|je cherche|je veux|je voudrais)\b",
         normalized,
     )
-    if normalized.isdigit() and state.state == "selecting":
-        intention, params = "get_product", {"position": int(normalized)}
+    selection_phrase = re.search(r"\b(\d+)\b", normalized)
+    explicit_selection = bool(
+        selection_phrase
+        and (
+            normalized.isdigit()
+            or re.search(r"\b(numero|choisis|choix|prends|selectionne)\b", normalized)
+            or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
+        )
+    )
+    if explicit_selection and state.state == "selecting":
+        intention, params = "get_product", {"position": int(selection_phrase.group(1))}
+    elif re.search(
+        r"\b(commande|commander|commandé|valide|valider|finalise|finaliser)\b",
+        normalized,
+    ) and re.search(r"\b(commande|panier|le|la)\b", normalized):
+        intention = "create_order"
     elif re.search(r"\b(voir|affiche|montre|consulte)\b.{0,20}\b(panier|cart)\b", normalized) or normalized in {"panier", "mon panier"}:
         intention = "cart_view"
     elif commerce_words or product_question:
@@ -1278,14 +1292,39 @@ def _apply_conversation_rules(analysis, message, state):
         return {**analysis, "intention": "cancel_pending_action", "params": {}, "confidence": 1}
     if not state.pending_action and state.pending_product_id and normalized in AFFIRMATIVE_MESSAGES:
         return {**analysis, "intention": "cart_add", "params": {}, "confidence": 1}
-    if normalized.isdigit() and state.state == "selecting":
+    selection_match = re.search(r"\b(\d+)\b", normalized)
+    explicit_selection = bool(
+        selection_match
+        and (
+            normalized.isdigit()
+            or re.search(r"\b(numero|choisis|choix|prends|selectionne)\b", normalized)
+            or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
+            or analysis.get("intention") == "get_product"
+        )
+    )
+    if explicit_selection and state.state == "selecting":
         return {
             **analysis,
             "intention": "get_product",
-            "params": {"position": int(normalized)},
+            "params": {"position": int(selection_match.group(1))},
             "confidence": 1,
         }
     return analysis
+
+
+def _naturalize_answer(message, analysis, commerce_result, safe_answer, trace_id):
+    if not safe_answer or not getattr(settings, "KIMI_NATURAL_RESPONSES", False):
+        return safe_answer, False
+    try:
+        answer = KimiClient().formulate(
+            message, analysis, commerce_result, safe_answer
+        )
+        return answer, False
+    except CommerceError as exc:
+        logger.warning(
+            "Formulation Kimi indisponible trace=%s: %s", trace_id, exc.message
+        )
+        return safe_answer, True
 
 
 def _display_price(value):
@@ -1403,7 +1442,22 @@ def _message_turn(data):
         }
     basic = BASIC_FRENCH_RESPONSES.get(_normalise_message(message))
     if basic:
-        return {"message": basic, "silent": False, "trace_id": trace_id}
+        analysis = {
+            "intention": "other",
+            "params": {},
+            "confidence": 1,
+            "langue_detectee": "français",
+            "reformulation": message,
+        }
+        answer, formulation_degraded = _naturalize_answer(
+            message, analysis, {"executed": False, "intention": "other"}, basic, trace_id
+        )
+        return {
+            "message": answer,
+            "silent": False,
+            "trace_id": trace_id,
+            "degraded": formulation_degraded,
+        }
 
     degraded = False
     local_analysis = _fallback_analysis(message, state)
@@ -1446,6 +1500,10 @@ def _message_turn(data):
             "error_type": "commerce_unavailable",
         }
     answer = _format_french_message(analysis, commerce_result)
+    answer, formulation_degraded = _naturalize_answer(
+        message, analysis, commerce_result, answer, trace_id
+    )
+    degraded = degraded or formulation_degraded
     silent = answer is None
     logger.info(
         "message_turn terminé trace=%s intention=%s degraded=%s silent=%s",

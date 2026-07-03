@@ -112,6 +112,11 @@ COMMERCE_CATALOG_PROVIDER = (
 KIMI_API_KEY = os.getenv("KIMI_API_KEY", "").strip()
 KIMI_MODEL = os.getenv("KIMI_MODEL", "moonshot-v1-8k").strip()
 KIMI_TIMEOUT = int(os.getenv("KIMI_TIMEOUT", "15"))
+KIMI_NATURAL_RESPONSES = (
+    False
+    if TESTING
+    else os.getenv("KIMI_NATURAL_RESPONSES", "True").lower() in {"1", "true", "yes"}
+)
 
 CACHES = {
     "default": {
