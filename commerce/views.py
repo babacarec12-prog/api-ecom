@@ -1548,11 +1548,19 @@ def _message_turn(data):
     digest = hashlib.sha256(
         f"{normalized['user_id']}:{turn_id}".encode("utf-8")
     ).hexdigest()
-    return _idempotent(
+    result = _idempotent(
         "message_turn",
         {"idempotency_key": f"turn:{digest}"},
         lambda: _message_turn_uncached(normalized),
     )
+    # Le transport n8n/OpenWA ne doit pas reconstruire ces identifiants depuis
+    # un autre nœud. Ils accompagnent toujours la réponse métier, y compris
+    # lorsque celle-ci provient du cache d'idempotence.
+    return {
+        **result,
+        "chat_id": str(normalized["user_id"]),
+        "session_id": str(normalized.get("session_key") or "current"),
+    }
 
 
 HANDLERS = {

@@ -1076,6 +1076,8 @@ class MessageTurnTests(TestCase):
         self.assertIn("Bonjour", payload["message"])
         self.assertFalse(payload["silent"])
         self.assertEqual(payload["trace_id"], "message-1")
+        self.assertEqual(payload["chat_id"], self.user_id)
+        self.assertEqual(payload["session_id"], "whatsapp-test")
         kimi_class.assert_not_called()
 
     @override_settings(KIMI_NATURAL_RESPONSES=True)
