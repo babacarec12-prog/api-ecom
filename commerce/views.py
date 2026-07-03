@@ -1,6 +1,7 @@
 """Endpoint unique utilisé par l'agent IA et le workflow n8n."""
 
 import hmac
+import hashlib
 import json
 import logging
 import re
@@ -1325,6 +1326,11 @@ def _naturalize_answer(message, analysis, commerce_result, safe_answer, trace_id
             "Formulation Kimi indisponible trace=%s: %s", trace_id, exc.message
         )
         return safe_answer, True
+    except Exception:
+        # Une erreur de style ne doit jamais annuler une opération métier déjà
+        # réussie ni provoquer un nouvel essai de commande par n8n.
+        logger.exception("Erreur inattendue de formulation Kimi trace=%s", trace_id)
+        return safe_answer, True
 
 
 def _display_price(value):
@@ -1419,7 +1425,7 @@ def _format_french_message(analysis, commerce_result):
     return "Je n'ai pas bien compris votre demande. Pouvez-vous la préciser en quelques mots ?"
 
 
-def _message_turn(data):
+def _message_turn_uncached(data):
     """Traite un message complet et renvoie directement la réponse WhatsApp."""
     _required(data, "user_id", "message")
     user_id = str(data["user_id"])
@@ -1520,6 +1526,23 @@ def _message_turn(data):
         "analysis": analysis,
         "commerce": commerce_result,
     }
+
+
+def _message_turn(data):
+    """Garantit qu'un même message OpenWA n'est traité qu'une seule fois."""
+    _required(data, "user_id", "message")
+    turn_id = str(
+        data.get("message_id") or data.get("timestamp") or uuid4().hex
+    ).strip()
+    normalized = {**data, "message_id": turn_id}
+    digest = hashlib.sha256(
+        f"{normalized['user_id']}:{turn_id}".encode("utf-8")
+    ).hexdigest()
+    return _idempotent(
+        "message_turn",
+        {"idempotency_key": f"turn:{digest}"},
+        lambda: _message_turn_uncached(normalized),
+    )
 
 
 HANDLERS = {

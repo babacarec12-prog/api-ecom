@@ -987,11 +987,23 @@ class MessageTurnTests(TestCase):
             "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?"
         )
         payload = self.post_message("bonjour").json()["data"]
+        repeated = self.post_message("bonjour").json()["data"]
         self.assertEqual(
             payload["message"],
             "Bonjour, ravi de vous accueillir ! Que puis-je faire pour vous ?",
         )
+        self.assertEqual(repeated["message"], payload["message"])
         kimi_class.return_value.formulate.assert_called_once()
+
+    @override_settings(KIMI_NATURAL_RESPONSES=True)
+    @patch("commerce.views.KimiClient")
+    def test_formulation_error_never_breaks_business_response(self, kimi_class):
+        kimi_class.return_value.formulate.side_effect = ValueError("format error")
+        response = self.post_message("bonjour")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["data"]
+        self.assertIn("Bonjour", payload["message"])
+        self.assertTrue(payload["degraded"])
 
     def test_wolof_number_selection_is_not_treated_as_quantity(self):
         ConversationState.objects.create(

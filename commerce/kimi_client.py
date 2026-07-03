@@ -41,6 +41,8 @@ ton chaleureux, humain et concis. Les données métier et la réponse sûre four
 sont la seule vérité : ne change aucun produit, prix, quantité, total, numéro de
 commande ou état. N'ajoute aucune information commerciale. Pour une liste,
 conserve toutes les lignes et tous les montants. Sans Markdown ni astérisques.
+Tu dois réellement reformuler : ne recopie pas mot pour mot la réponse sûre.
+Varie naturellement l'introduction et la conclusion selon le message du client.
 Retourne uniquement le message final destiné au client.
 """
 
@@ -113,22 +115,36 @@ class KimiClient:
         return parsed
 
     def formulate(self, message, analysis, commerce_result, safe_answer):
+        messages = [
+            {"role": "system", "content": FORMULATION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Message client : " + str(message)
+                    + "\nIntention : " + json.dumps(analysis, ensure_ascii=False, default=str)
+                    + "\nRésultat métier : " + json.dumps(commerce_result, ensure_ascii=False, default=str)
+                    + "\nRéponse sûre à reformuler : " + str(safe_answer)
+                ),
+            },
+        ]
         raw = self._completion(
-            [
-                {"role": "system", "content": FORMULATION_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Message client : " + str(message)
-                        + "\nIntention : " + json.dumps(analysis, ensure_ascii=False, default=str)
-                        + "\nRésultat métier : " + json.dumps(commerce_result, ensure_ascii=False, default=str)
-                        + "\nRéponse sûre à reformuler : " + str(safe_answer)
-                    ),
-                },
-            ],
-            temperature=0.55,
+            messages,
+            temperature=0.75,
             max_tokens=700,
         )
+        if " ".join(raw.split()).casefold() == " ".join(str(safe_answer).split()).casefold():
+            raw = self._completion(
+                [
+                    *messages,
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": "Cette réponse est trop mécanique. Reformule-la vraiment en français naturel tout en conservant exactement les faits.",
+                    },
+                ],
+                temperature=0.9,
+                max_tokens=700,
+            )
         answer = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE)
         answer = answer.replace("**", "").strip()
         if not answer:
