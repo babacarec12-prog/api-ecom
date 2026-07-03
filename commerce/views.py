@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 import unicodedata
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
@@ -21,6 +22,7 @@ from .exceptions import CommerceError
 from .database_client import DatabaseCatalogClient
 from .kimi_client import KimiClient
 from .models import (
+    ApiLog,
     Cart,
     ConversationState,
     HumanTransfer,
@@ -87,7 +89,7 @@ ALLOWED_ACTIONS = {
 def _required(data, *fields):
     missing = [field for field in fields if data.get(field) in (None, "", [])]
     if missing:
-        raise CommerceError(f"Champ(s) requis manquant(s) : {', '.join(missing)}.", 400)
+        raise CommerceError(f"Paramètre manquant: {missing[0]}", 400)
 
 
 def _decimal(value, field, *, positive=False):
@@ -613,8 +615,10 @@ def _check_human_status(data):
     _required(data, "user_id")
     state = _state(data["user_id"])
     transfer = HumanTransfer.objects.filter(user_id=str(data["user_id"]), status="pending").order_by("-created_at").first()
+    active = state.state == "human_takeover"
     return {
-        "human_takeover": state.state == "human_takeover",
+        "human_active": active,
+        "human_takeover": active,
         "status": transfer.status if transfer else None,
     }
 
@@ -1593,10 +1597,24 @@ HANDLERS = {
 }
 
 
+def _write_api_log(*, user_id, action, success, error, started_at):
+    """Écrit le journal sans jamais faire échouer la réponse principale."""
+    try:
+        ApiLog.objects.create(
+            user_id=str(user_id or "")[:100],
+            action=str(action or "")[:100],
+            success=bool(success),
+            error=str(error or "")[:2000],
+            duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+        )
+    except Exception:
+        logger.exception("Impossible d'enregistrer le journal api_logs")
+
+
 def _security_error(request):
     expected = str(getattr(settings, "N8N_API_TOKEN", "") or "")
     if expected and not hmac.compare_digest(request.headers.get("X-API-Token", ""), expected):
-        return Response({"success": False, "error": "Unauthorized"}, status=401)
+        return Response({"success": False, "error": "Unauthorized", "data": {}}, status=401)
 
     limit = int(getattr(settings, "COMMERCE_RATE_LIMIT", 60))
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
@@ -1611,7 +1629,7 @@ def _security_error(request):
             cache.set(key, 1, timeout=60)
             count = 1
     if count > limit:
-        return Response({"success": False, "error": "Too Many Requests"}, status=429)
+        return Response({"success": False, "error": "Too Many Requests", "data": {}}, status=429)
     return None
 
 
@@ -1619,18 +1637,30 @@ def _security_error(request):
 @permission_classes([AllowAny])
 def commerce(request):
     """Route toutes les opérations e-commerce via le champ ``action``."""
+    started_at = time.perf_counter()
+    action = ""
+    user_id = ""
+    succeeded = False
+    error_message = ""
     security_error = _security_error(request)
     if security_error:
         return security_error
     try:
         if not isinstance(request.data, dict):
             raise CommerceError("Le corps de la requête doit être un objet JSON.", 400)
-        action = request.data.get("action")
+        action = str(request.data.get("action") or "").strip()
         data = request.data.get("data", {})
         if action not in ALLOWED_ACTIONS:
-            raise CommerceError(
-                f"Action invalide. Actions acceptées : {', '.join(sorted(ALLOWED_ACTIONS))}.",
-                400,
+            succeeded = True
+            return Response(
+                {
+                    "success": True,
+                    "data": {
+                        "message": "Action non reconnue",
+                        "available_actions": sorted(ALLOWED_ACTIONS),
+                    },
+                },
+                status=200,
             )
         if isinstance(data, str):
             raw_data = data.strip()
@@ -1643,14 +1673,35 @@ def commerce(request):
                     raise CommerceError("Le champ 'data' doit être un objet JSON valide.", 400)
         if not isinstance(data, dict):
             raise CommerceError("Le champ 'data' doit être un objet JSON.", 400)
-        return Response({"success": True, "data": HANDLERS[action](data)}, status=200)
+        user_id = data.get("user_id", "")
+        result = HANDLERS[action](data)
+        succeeded = True
+        return Response({"success": True, "data": result}, status=200)
     except CommerceError as exc:
-        return Response({"success": False, "error": exc.message}, status=exc.status_code)
+        error_message = exc.message
+        if "woocommerce" in error_message.casefold() and any(
+            word in error_message.casefold()
+            for word in ("inaccessible", "configuration", "json invalide")
+        ):
+            error_message = "Boutique temporairement inaccessible"
+        return Response(
+            {"success": False, "error": error_message, "data": {}},
+            status=exc.status_code,
+        )
     except APIException:
         raise
     except Exception:
         logger.exception("Erreur inattendue dans l'endpoint commerce")
+        error_message = "Erreur inattendue, réessayez"
         return Response(
-            {"success": False, "error": "Une erreur interne inattendue est survenue."},
-            status=500,
+            {"success": False, "error": error_message, "data": {}},
+            status=200,
+        )
+    finally:
+        _write_api_log(
+            user_id=user_id,
+            action=action,
+            success=succeeded,
+            error=error_message,
+            started_at=started_at,
         )

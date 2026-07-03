@@ -26,9 +26,11 @@ class WooCommerceClient:
         "commande",
     }
     def __init__(self):
-        store_url = os.getenv("WOO_STORE_URL", "").strip().rstrip("/")
-        key = os.getenv("WOO_CONSUMER_KEY", "").strip()
-        secret = os.getenv("WOO_CONSUMER_SECRET", "").strip()
+        # Les alias courts gardent la compatibilité avec le cahier des charges
+        # sans casser les noms historiques déjà utilisés sur Render.
+        store_url = (os.getenv("WOO_STORE_URL") or os.getenv("WOO_URL", "")).strip().rstrip("/")
+        key = (os.getenv("WOO_CONSUMER_KEY") or os.getenv("WOO_KEY", "")).strip()
+        secret = (os.getenv("WOO_CONSUMER_SECRET") or os.getenv("WOO_SECRET", "")).strip()
         if not store_url or not key or not secret:
             raise CommerceError("La configuration WooCommerce est incomplète.", 500)
         self.base_url = f"{store_url}/wp-json/wc/v3"

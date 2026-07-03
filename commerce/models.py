@@ -136,3 +136,18 @@ class ShopPolicy(models.Model):
 
     class Meta:
         db_table = "shop_policies"
+
+
+class ApiLog(models.Model):
+    """Journal technique minimal de chaque appel à l'API commerce."""
+
+    user_id = models.CharField(max_length=100, blank=True, db_index=True)
+    action = models.CharField(max_length=100, blank=True, db_index=True)
+    success = models.BooleanField(default=False, db_index=True)
+    error = models.TextField(blank=True)
+    duration_ms = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "api_logs"
+        ordering = ["-created_at"]

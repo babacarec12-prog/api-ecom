@@ -9,6 +9,7 @@ from commerce.exceptions import CommerceError
 from commerce.paytech_client import PayTechClient
 from commerce.woo_client import WooCommerceClient
 from commerce.models import (
+    ApiLog,
     Cart,
     ConversationState,
     HumanTransfer,
@@ -20,7 +21,7 @@ from commerce.models import (
 )
 
 
-class CommerceEndpointTests(SimpleTestCase):
+class CommerceEndpointTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
@@ -40,24 +41,96 @@ class CommerceEndpointTests(SimpleTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"success": True, "data": {"products": []}})
 
-    def test_unknown_action_is_rejected(self):
+    def test_unknown_action_returns_available_actions(self):
         response = self.client.post(
             "/api/commerce/", {"action": "delete_order", "data": {}}, format="json"
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertFalse(response.json()["success"])
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+        self.assertEqual(response.json()["data"]["message"], "Action non reconnue")
+        self.assertIn("search_products", response.json()["data"]["available_actions"])
 
     def test_get_method_uses_error_contract(self):
         response = self.client.get("/api/commerce/")
         self.assertEqual(response.status_code, 405)
-        self.assertEqual(set(response.json()), {"success", "error"})
+        self.assertEqual(set(response.json()), {"success", "error", "data"})
 
     def test_malformed_json_uses_error_contract(self):
         response = self.client.post(
             "/api/commerce/", data="{", content_type="application/json"
         )
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(set(response.json()), {"success", "error"})
+        self.assertEqual(set(response.json()), {"success", "error", "data"})
+
+    def test_api_call_is_logged(self):
+        response = self.client.post(
+            "/api/commerce/",
+            {"action": "cart_view", "data": {"user_id": "log-user"}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        log = ApiLog.objects.get(user_id="log-user", action="cart_view")
+        self.assertTrue(log.success)
+        self.assertGreaterEqual(log.duration_ms, 0)
+
+    def test_unknown_user_has_empty_cart_default_state_and_no_human(self):
+        cart = self.client.post(
+            "/api/commerce/",
+            {"action": "cart_view", "data": {"user_id": "new-user"}},
+            format="json",
+        )
+        state = self.client.post(
+            "/api/commerce/",
+            {"action": "get_state", "data": {"user_id": "new-user"}},
+            format="json",
+        )
+        human = self.client.post(
+            "/api/commerce/",
+            {"action": "check_human_status", "data": {"user_id": "new-user"}},
+            format="json",
+        )
+        self.assertEqual(cart.json()["data"]["items"], [])
+        self.assertEqual(state.json()["data"]["state"], "browsing")
+        self.assertFalse(human.json()["data"]["human_active"])
+
+    def test_missing_parameter_has_explicit_uniform_error(self):
+        response = self.client.post(
+            "/api/commerce/",
+            {"action": "cart_add", "data": {"user_id": "missing-field"}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {"success": False, "error": "Paramètre manquant: product_id", "data": {}},
+        )
+
+    @patch("commerce.views.HANDLERS")
+    def test_woocommerce_failure_is_normalized(self, handlers):
+        handlers.__getitem__.return_value.side_effect = CommerceError(
+            "WooCommerce est inaccessible : timeout", 502
+        )
+        response = self.client.post(
+            "/api/commerce/",
+            {"action": "get_product", "data": {"product_id": "1"}},
+            format="json",
+        )
+        self.assertEqual(response.json()["error"], "Boutique temporairement inaccessible")
+        self.assertEqual(response.json()["data"], {})
+
+    @patch("commerce.views.HANDLERS")
+    def test_unexpected_exception_never_returns_http_500(self, handlers):
+        handlers.__getitem__.return_value.side_effect = RuntimeError("boom")
+        response = self.client.post(
+            "/api/commerce/",
+            {"action": "get_state", "data": {"user_id": "unexpected"}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"success": False, "error": "Erreur inattendue, réessayez", "data": {}},
+        )
 
     @patch("commerce.views.HANDLERS")
     def test_search_accepts_plain_text_data_from_ai(self, handlers):

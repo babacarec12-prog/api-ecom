@@ -16,5 +16,5 @@ def json_exception_handler(exc, context):
         )
     else:
         message = str(response.data)
-    response.data = {"success": False, "error": message}
+    response.data = {"success": False, "error": message, "data": {}}
     return response

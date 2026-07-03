@@ -1,0 +1,113 @@
+{
+  "name": "AI Commerce Assistant - Workflow final",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "ai-commerce-openwa-v2", "options": {}},
+      "id": "webhook-openwa", "name": "Webhook OpenWA", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "position": [-1500, 0], "webhookId": "c9a113a4-e783-48fa-a95c-51bc899983f4"
+    },
+    {
+      "parameters": {"jsCode": "const root=$input.first().json;\nconst payload=root.body??root;\nconst data=payload.data??payload;\nconst message=data.message??data;\nif(Boolean(data.fromMe??data.key?.fromMe??message.fromMe??message.key?.fromMe))return [];\nconst type=String(data.type??message.type??payload.type??'text').toLowerCase();\nconst media=Boolean(data.isMedia??message.isMedia??data.mimetype??message.mimetype??['image','document','video','audio','ptt','sticker'].includes(type));\nlet text=data.body??data.text?.body??data.content??data.conversation??data.extendedTextMessage?.text??message.body??message.text?.body??message.conversation??message.extendedTextMessage?.text??'';\nif(!String(text).trim())text=media?'[MEDIA_SANS_TEXTE]':'[MESSAGE_VIDE]';\ndata.body=String(text).trim();\nreturn [{json:root}];"},
+      "id": "normaliser", "name": "Normaliser message", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-1300, 0], "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {"jsCode": "const root=$input.first().json;\nconst payload=root.body??root;\nconst data=payload.data??payload;\nconst message=data.message??data;\nconst headers=root.headers??{};\nconst key=String(headers['x-openwa-idempotency-key']??headers['X-OpenWA-Idempotency-Key']??'');\nconst match=key.match(/^msg_([^_]+)_(?:true|false)_([^_]+)_/);\nconst chatId=data.from??data.chatId??data.chat_id??data.key?.remoteJid??data.remoteJid??data.sender?.id??message.from??message.chatId??message.key?.remoteJid??payload.from??payload.chatId??match?.[2];\nconst messageText=data.body??message.body??'';\nconst sessionId=payload.sessionId??payload.session_id??data.sessionId??data.session_id??match?.[1];\nif(!chatId)throw new Error('Chat ID OpenWA introuvable');\nif(!sessionId)throw new Error('Session ID OpenWA introuvable');\nreturn [{json:{chatId:String(chatId),messageText:String(messageText).trim(),userId:String(chatId),userName:data.sender?.pushname??data.notifyName??'Client',sessionId:String(sessionId),timestamp:data.timestamp??message.timestamp??payload.timestamp??Date.now()}}];"},
+      "id": "extraire", "name": "Extraire message OpenWA", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-1100, 0], "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {"jsCode": "const s=$input.first().json;\nconst n=s.messageText.toLocaleLowerCase('fr-SN').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[.!?]+$/g,'').trim();\nconst replies={bonjour:'Bonjour ! Comment puis-je vous aider ? 😊',salam:'Bonjour ! Comment puis-je vous aider ? 😊',bonsoir:'Bonsoir ! Comment puis-je vous aider ? 😊',merci:'Avec plaisir ! 😊',bjr:'Bonjour ! Comment puis-je vous aider ? 😊',bsr:'Bonsoir ! Comment puis-je vous aider ? 😊','👍':'Parfait 👍','🙏':'Avec plaisir 🙏',ok:'D’accord 👍',\"d'accord\":'D’accord 👍'};\nreturn [{json:{...s,isBasic:Object.prototype.hasOwnProperty.call(replies,n),basicResponse:replies[n]??null}}];"},
+      "id": "basic-detect", "name": "Messages ultra basiques ?", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-900, 0], "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {"conditions":{"options":{"caseSensitive":true,"typeValidation":"strict","version":2},"conditions":[{"id":"basic","leftValue":"={{ $json.isBasic }}","rightValue":"","operator":{"type":"boolean","operation":"true","singleValue":true}}],"combinator":"and"},"options":{}},
+      "id":"basic-route","name":"Route message basique","type":"n8n-nodes-base.if","typeVersion":2.2,"position":[-700,0]
+    },
+    {
+      "parameters":{"jsCode":"const s=$input.first().json;return [{json:{...s,candidate:s.basicResponse,intention:'conversation_libre',langue:'fr'}}];"},
+      "id":"basic-reply","name":"Préparer réponse basique","type":"n8n-nodes-base.code","typeVersion":2,"position":[-480,-180],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"operation":"executeQuery","query":"SELECT message FROM message_history WHERE session_id = $1 ORDER BY id DESC LIMIT 3;","options":{"queryReplacement":"={{ [$('Messages ultra basiques ?').first().json.userId] }}"}},
+      "id":"memory-read","name":"Lire les 3 derniers messages","type":"n8n-nodes-base.postgres","typeVersion":2.6,"position":[-560,100],"alwaysOutputData":true,"credentials":{"postgres":{"id":"NqldjDUTxmFDZur8","name":"Postgres account 2"}},"onError":"continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","authentication":"none","sendHeaders":true,
+        "headerParameters":{"parameters":[{"name":"Authorization","value":"Bearer REPLACE_WITH_KIMI_API_KEY"},{"name":"Content-Type","value":"application/json"}]},
+        "sendBody":true,"contentType":"raw","rawContentType":"application/json",
+        "body":"={{ (()=>{const source=$('Messages ultra basiques ?').first().json;return JSON.stringify({model:'moonshot-v1-8k',temperature:0.1,max_tokens:500,messages:[{role:'system',content:`Tu analyses les messages WhatsApp d'une boutique sénégalaise. Comprends le français, le wolof mélangé, l'argot, les fautes et les messages courts. Utilise le contexte des trois derniers échanges fourni par l'utilisateur. Retourne UNIQUEMENT un JSON valide. Intentions: search_products, cart_add, cart_view, cart_remove, cart_clear, cart_update_quantity, create_order, generate_payment, get_order_status, cancel_order, transfer_to_human, get_policy, get_state, set_state, revert_state, check_human_status, get_product_by_position, check_variant_stock, validate_coupon, get_tracking, request_refund, conversation_libre. Schéma: {\"intention\":\"...\",\"params\":{\"query\":null,\"position\":null,\"quantity\":null,\"order_id\":null,\"policy_type\":null,\"product_name\":null,\"price\":null,\"reason\":null,\"code\":null},\"confidence\":0.95,\"reformulation\":\"en français clair\",\"langue\":\"fr|wolof_mix|argot\"}. Exemples: 2 bissap => cart_add quantité 2 produit bissap; hp => search_products; je prends le 2 => get_product_by_position; mon colis bi ana => get_order_status; livraison => get_policy delivery; parler à quelqu'un => transfer_to_human.`},{role:'user',content:'Contexte récent: '+JSON.stringify($input.all().map(i=>i.json))+'\\nMessage actuel: '+source.messageText}]})})() }}",
+        "options":{"timeout":20000}
+      },
+      "id":"kimi-analyse","name":"Kimi analyse l'intention","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[-480,100],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"jsCode":"const source=$('Messages ultra basiques ?').first().json;const response=$input.first().json;let raw=String(response?.choices?.[0]?.message?.content??'').replace(/```(?:json)?/gi,'').replace(/```/g,'').trim();const a=raw.indexOf('{'),b=raw.lastIndexOf('}');let parsed={};try{parsed=JSON.parse(a>=0&&b>a?raw.slice(a,b+1):raw)}catch{}const allowed=new Set(['search_products','cart_add','cart_view','cart_remove','cart_clear','cart_update_quantity','create_order','generate_payment','get_order_status','cancel_order','transfer_to_human','get_policy','get_state','set_state','revert_state','check_human_status','get_product_by_position','check_variant_stock','validate_coupon','get_tracking','request_refund','conversation_libre']);let intention=allowed.has(parsed.intention)?parsed.intention:'conversation_libre';const confidence=Math.max(0,Math.min(1,Number(parsed.confidence)||0));const needsClarification=confidence<0.5;if(needsClarification)intention='conversation_libre';return [{json:{...source,intention,params:parsed.params&&typeof parsed.params==='object'?parsed.params:{},confidence,reformulation:String(parsed.reformulation||source.messageText),langue:String(parsed.langue||'fr'),needsClarification,conversationPrompt:needsClarification?'Demande poliment au client de préciser sa demande.':'Réponds naturellement au message du client.'}}];"},
+      "id":"parser-kimi","name":"Parser réponse Kimi","type":"n8n-nodes-base.code","typeVersion":2,"position":[-260,100],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"conditions":{"options":{"caseSensitive":true,"typeValidation":"strict","version":2},"conditions":[{"id":"free","leftValue":"={{ $json.intention }}","rightValue":"conversation_libre","operator":{"type":"string","operation":"equals"}}],"combinator":"and"},"options":{}},
+      "id":"free-route","name":"Conversation libre ?","type":"n8n-nodes-base.if","typeVersion":2.2,"position":[-40,100]
+    },
+    {
+      "parameters":{"method":"POST","url":"https://ai-commerce-api-babacare.onrender.com/api/commerce/","authentication":"none","sendHeaders":true,"headerParameters":{"parameters":[{"name":"X-API-Token","value":"REPLACE_WITH_N8N_API_TOKEN"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ JSON.stringify({action:'check_human_status',data:{user_id:$('Parser réponse Kimi').first().json.userId}}) }}","options":{"timeout":30000}},
+      "id":"human-check","name":"Vérifier human_takeover","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[180,180],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"conditions":{"options":{"caseSensitive":true,"typeValidation":"strict","version":2},"conditions":[{"id":"human","leftValue":"={{ Boolean($json.data?.human_active ?? $json.data?.human_takeover) }}","rightValue":"","operator":{"type":"boolean","operation":"true","singleValue":true}}],"combinator":"and"},"options":{}},
+      "id":"human-route","name":"Human takeover actif ?","type":"n8n-nodes-base.if","typeVersion":2.2,"position":[400,180]
+    },
+    {
+      "parameters":{"jsCode":"const s=$('Parser réponse Kimi').first().json;return [{json:{...s,candidate:'Notre équipe s’occupe de vous, on arrive !'}}];"},
+      "id":"human-reply","name":"Préparer réponse humaine","type":"n8n-nodes-base.code","typeVersion":2,"position":[620,60],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"method":"POST","url":"https://ai-commerce-api-babacare.onrender.com/api/commerce/","authentication":"none","sendHeaders":true,"headerParameters":{"parameters":[{"name":"X-API-Token","value":"REPLACE_WITH_N8N_API_TOKEN"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ (()=>{const s=$('Parser réponse Kimi').first().json;const clean=Object.fromEntries(Object.entries(s.params||{}).filter(([,v])=>v!==null&&v!==''));return JSON.stringify({action:s.intention,data:{user_id:s.userId,session_key:s.sessionId,timestamp:s.timestamp,...clean}})})() }}","options":{"timeout":60000}},
+      "id":"django-api","name":"Appeler Django API","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[620,260],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","authentication":"none","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"Bearer REPLACE_WITH_KIMI_API_KEY"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ (()=>{const s=$('Parser réponse Kimi').first().json;const result=s.intention==='conversation_libre'?{success:true,data:{instruction:s.conversationPrompt,message_client:s.messageText}}:$json;return JSON.stringify({model:'moonshot-v1-8k',temperature:0.3,max_tokens:600,messages:[{role:'system',content:`Tu es l'assistant WhatsApp de SN_DIGITAL, boutique en ligne au Sénégal. Réponds strictement en français, en 4 lignes maximum, naturellement et chaleureusement. Base-toi uniquement sur le résultat fourni pour les faits commerciaux. Sans Markdown, sans étoiles. Maximum 2 emojis. Si success=false, dis que tu vérifies et invite à réessayer, sans dire service indisponible. Pour un panier, donne le total. Pour des produits, fais une liste numérotée avec les prix FCFA. Pour une commande créée, félicite et donne le lien de paiement s'il existe. Tutoie seulement si le client tutoie.`},{role:'user',content:'Message client: '+s.messageText+'\\nIntention: '+s.intention+'\\nLangue détectée: '+s.langue+'\\nRésultat: '+JSON.stringify(result)}]})})() }}","options":{"timeout":20000}},
+      "id":"kimi-format","name":"Kimi formule la réponse","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[860,260],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"jsCode":"const input=$input.first().json;const source=$('Messages ultra basiques ?').first().json;let answer=String(input.candidate??input.choices?.[0]?.message?.content??'').replace(/<think>[\\s\\S]*?<\\/think>/gi,'').replace(/[\\*~`_]/g,'').replace(/\\n{3,}/g,'\\n\\n').trim();if(!answer||/(system message|\\\"arguments\\\"\\s*:|\\\"tool_calls\\\"\\s*:|^\\s*[{[])/i.test(answer))answer='Désolé, je vérifie cela. Pouvez-vous réessayer dans quelques instants ? 🙏';let intention='conversation_libre',langue='fr';try{const p=$('Parser réponse Kimi').first().json;intention=p.intention;langue=p.langue}catch{}return [{json:{...source,intention,langue,reponse_finale:answer}}];"},
+      "id":"clean","name":"Nettoyer réponse","type":"n8n-nodes-base.code","typeVersion":2,"position":[1100,120],"onError":"continueErrorOutput"
+    },
+    {
+      "parameters":{"operation":"executeQuery","query":"INSERT INTO message_history (session_id, message) VALUES ($1, $2::jsonb);","options":{"queryReplacement":"={{ [$json.userId, JSON.stringify({user:$json.messageText,assistant:$json.reponse_finale,intention:$json.intention,timestamp:new Date().toISOString()})] }}"}},
+      "id":"memory","name":"Sauvegarder en mémoire Supabase","type":"n8n-nodes-base.postgres","typeVersion":2.6,"position":[1320,120],"alwaysOutputData":true,"credentials":{"postgres":{"id":"NqldjDUTxmFDZur8","name":"Postgres account 2"}},"onError":"continueRegularOutput"
+    },
+    {
+      "parameters":{"sessionId":"={{ $('Nettoyer réponse').first().json.sessionId }}","chatId":"={{ $('Nettoyer réponse').first().json.chatId }}","message":"={{ $('Nettoyer réponse').first().json.reponse_finale }}"},
+      "id":"send","name":"Envoyer réponse OpenWA","type":"@rmyndharis/n8n-nodes-openwa.openWa","typeVersion":1,"position":[1540,120],"credentials":{"openWaApi":{"id":"onObfWB7kdMkd5xj","name":"OpenWA account 2"}}
+    },
+    {
+      "parameters":{"jsCode":"let source={};try{source=$('Messages ultra basiques ?').first().json}catch{try{source=$('Extraire message OpenWA').first().json}catch{}}return [{json:{...source,candidate:'Désolé, je rencontre un petit souci technique. Je reviens vers vous dans quelques instants ! 🙏',intention:'fallback',langue:'fr'}}];"},
+      "id":"fallback","name":"Fallback global","type":"n8n-nodes-base.code","typeVersion":2,"position":[860,500]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook OpenWA":{"main":[[{"node":"Normaliser message","type":"main","index":0}]]},
+    "Normaliser message":{"main":[[{"node":"Extraire message OpenWA","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Extraire message OpenWA":{"main":[[{"node":"Messages ultra basiques ?","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Messages ultra basiques ?":{"main":[[{"node":"Route message basique","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Route message basique":{"main":[[{"node":"Préparer réponse basique","type":"main","index":0}],[{"node":"Lire les 3 derniers messages","type":"main","index":0}]]},
+    "Préparer réponse basique":{"main":[[{"node":"Nettoyer réponse","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Lire les 3 derniers messages":{"main":[[{"node":"Kimi analyse l'intention","type":"main","index":0}]]},
+    "Kimi analyse l'intention":{"main":[[{"node":"Parser réponse Kimi","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Parser réponse Kimi":{"main":[[{"node":"Conversation libre ?","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Conversation libre ?":{"main":[[{"node":"Kimi formule la réponse","type":"main","index":0}],[{"node":"Vérifier human_takeover","type":"main","index":0}]]},
+    "Vérifier human_takeover":{"main":[[{"node":"Human takeover actif ?","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Human takeover actif ?":{"main":[[{"node":"Préparer réponse humaine","type":"main","index":0}],[{"node":"Appeler Django API","type":"main","index":0}]]},
+    "Préparer réponse humaine":{"main":[[{"node":"Nettoyer réponse","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Appeler Django API":{"main":[[{"node":"Kimi formule la réponse","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Kimi formule la réponse":{"main":[[{"node":"Nettoyer réponse","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Fallback global":{"main":[[{"node":"Nettoyer réponse","type":"main","index":0}]]},
+    "Nettoyer réponse":{"main":[[{"node":"Sauvegarder en mémoire Supabase","type":"main","index":0}],[{"node":"Fallback global","type":"main","index":0}]]},
+    "Sauvegarder en mémoire Supabase":{"main":[[{"node":"Envoyer réponse OpenWA","type":"main","index":0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder":"v1","availableInMCP":false},
+  "meta": {"templateCredsSetupCompleted":true},
+  "tags": []
+}
