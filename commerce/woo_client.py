@@ -178,6 +178,71 @@ class WooCommerceClient:
         cache.set(cache_key, formatted, timeout=60)
         return formatted
 
+    def export_catalogue(self):
+        """Retourne tout le catalogue WooCommerce normalisé pour PostgreSQL."""
+        exported = []
+        page = 1
+        while True:
+            products = self._request(
+                "GET",
+                "products",
+                params={"per_page": 100, "page": page, "status": "publish"},
+            )
+            if not products:
+                break
+            for product in products:
+                variants = []
+                if product.get("variations"):
+                    raw_variants = self._request(
+                        "GET",
+                        f"products/{product['id']}/variations",
+                        params={"per_page": 100},
+                    )
+                    variants = [
+                        {
+                            "id": str(item.get("id")),
+                            "sku": item.get("sku") or "",
+                            "prix": item.get("price") or "",
+                            "stock": self._stock(item),
+                            "en_stock": item.get("stock_status") != "outofstock",
+                            "attributs": item.get("attributes", []),
+                            "image": (item.get("image") or {}).get("src"),
+                        }
+                        for item in raw_variants
+                    ]
+                images = [
+                    image.get("src")
+                    for image in product.get("images", [])
+                    if image.get("src")
+                ]
+                categories = [
+                    item.get("name")
+                    for item in product.get("categories", [])
+                    if item.get("name")
+                ]
+                exported.append(
+                    {
+                        "external_id": str(product["id"]),
+                        "name": product.get("name") or "Produit",
+                        "description": product.get("description")
+                        or product.get("short_description")
+                        or "",
+                        "category": ", ".join(categories)[:100],
+                        "price": product.get("price") or "0",
+                        "stock": max(0, int(self._stock(product) or 0)),
+                        "sku": product.get("sku") or "",
+                        "image_url": images[0] if images else "",
+                        "images": images,
+                        "variants": variants,
+                        "platform": "woocommerce",
+                        "active": product.get("status") == "publish",
+                    }
+                )
+            if len(products) < 100:
+                break
+            page += 1
+        return exported
+
     def get_product(self, product_id):
         product = self._request("GET", f"products/{product_id}")
         variations = []

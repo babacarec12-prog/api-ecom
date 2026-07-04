@@ -1,5 +1,20 @@
 # Actions WooCommerce ajoutées
 
+## Synchroniser le catalogue
+
+Après avoir configuré `WOO_STORE_URL`, `WOO_CONSUMER_KEY` et
+`WOO_CONSUMER_SECRET`, lancer :
+
+```bash
+python manage.py sync_woocommerce_catalog
+```
+
+La commande est idempotente. Elle synchronise les noms, descriptions,
+catégories, prix, stocks, SKU, images et variantes dans PostgreSQL. Les produits
+WooCommerce qui ne sont plus publiés sont désactivés localement sans être
+supprimés. En production, cette commande devra être planifiée après la
+connexion de la boutique réelle.
+
 Toutes les opérations utilisent le même endpoint :
 
 ```http

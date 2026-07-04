@@ -28,6 +28,7 @@ from .models import (
     HumanTransfer,
     ProcessedRequest,
     ProductSelection,
+    PaymentTransaction,
     ShopPolicy,
     UserOrder,
 )
@@ -202,6 +203,7 @@ def _cart_payload(user_id):
     items = [
         {
             "product_id": row.product_id,
+            "variant_id": row.variant_id or None,
             "product_name": row.product_name,
             "quantity": row.quantity,
             "price": str(row.price),
@@ -314,6 +316,7 @@ def _cart_add(data):
     row, created = Cart.objects.get_or_create(
         user_id=str(data["user_id"]),
         product_id=str(data["product_id"]),
+        variant_id=str(data.get("variant_id") or ""),
         defaults={
             "product_name": str(data["product_name"]),
             "quantity": quantity,
@@ -338,7 +341,12 @@ def _cart_add(data):
 
 def _cart_remove(data):
     _required(data, "user_id", "product_id")
-    Cart.objects.filter(user_id=str(data["user_id"]), product_id=str(data["product_id"])).delete()
+    query = Cart.objects.filter(user_id=str(data["user_id"]), product_id=str(data["product_id"]))
+    if data.get("variant_id") not in (None, ""):
+        query = query.filter(variant_id=str(data["variant_id"]))
+    elif query.count() > 1:
+        raise CommerceError("Précisez la variante à retirer du panier.", 400)
+    query.delete()
     return _cart_payload(data["user_id"])
 
 
@@ -349,6 +357,10 @@ def _cart_update_quantity(data):
     except (TypeError, ValueError) as exc:
         raise CommerceError("La quantité doit être un entier.", 400) from exc
     query = Cart.objects.filter(user_id=str(data["user_id"]), product_id=str(data["product_id"]))
+    if data.get("variant_id") not in (None, ""):
+        query = query.filter(variant_id=str(data["variant_id"]))
+    elif query.count() > 1:
+        raise CommerceError("Précisez la variante à modifier dans le panier.", 400)
     if not query.exists():
         raise CommerceError("Ce produit n'est pas dans le panier.", 404)
     if quantity <= 0:
@@ -461,7 +473,12 @@ def _create_order(data):
         source_cart = data.get("cart")
         if source_cart is None:
             source_cart = [
-                {"product_id": row.product_id, "quantity": row.quantity, "platform": row.platform}
+                {
+                    "product_id": row.product_id,
+                    "variant_id": row.variant_id or None,
+                    "quantity": row.quantity,
+                    "platform": row.platform,
+                }
                 for row in Cart.objects.filter(user_id=str(data["user_id"]))
             ]
         _, cart = _validate_cart(source_cart, platform)
@@ -499,10 +516,84 @@ def _generate_payment(data):
             raise CommerceError("Le paiement exige une commande WooCommerce créée et vérifiée.", 409)
         _owned_order(data)
         result = PayTechClient().generate_payment(data["order_id"], data["amount"])
+        PaymentTransaction.objects.update_or_create(
+            reference=result["reference"],
+            defaults={
+                "user_id": str(data["user_id"]),
+                "order_id": str(data["order_id"]),
+                "token": result["token"],
+                "payment_url": result["payment_url"],
+                "amount": _decimal(data["amount"], "amount", positive=True),
+                "currency": "XOF",
+                "provider": "paytech",
+                "status": "pending",
+            },
+        )
         _move_state(state, "payment_pending")
         return result
 
     return _idempotent("generate_payment", data, execute)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def paytech_ipn(request):
+    """Reçoit et applique une notification PayTech authentifiée."""
+    payload = request.data.dict() if hasattr(request.data, "dict") else request.data
+    if not isinstance(payload, dict):
+        return Response({"success": False, "error": "Notification invalide.", "data": {}}, status=400)
+    try:
+        client = PayTechClient()
+        if not client.verify_ipn(payload):
+            return Response({"success": False, "error": "Signature PayTech invalide.", "data": {}}, status=403)
+        reference = str(payload.get("ref_command") or "").strip()
+        event = str(payload.get("type_event") or "").strip()
+        if event not in {"sale_complete", "sale_canceled"}:
+            raise CommerceError("Événement PayTech inconnu.", 400)
+        with transaction.atomic():
+            payment = PaymentTransaction.objects.select_for_update().filter(reference=reference).first()
+            if not payment:
+                raise CommerceError("Transaction PayTech introuvable.", 404)
+            notified_amount = _decimal(
+                payload.get("item_price") or payload.get("amount"), "item_price", positive=True
+            )
+            if notified_amount != payment.amount:
+                raise CommerceError("Le montant PayTech ne correspond pas à la transaction.", 409)
+            if payment.status != "paid":
+                payment.status = "paid" if event == "sale_complete" else "canceled"
+            payment.last_event = event
+            payment.callback_payload = json.loads(json.dumps(payload, default=str))
+            payment.save(update_fields=["status", "last_event", "callback_payload", "updated_at"])
+            order = UserOrder.objects.filter(
+                order_id=payment.order_id, user_id=payment.user_id
+            ).first()
+            if order and payment.status == "paid":
+                order.status = "processing"
+                order.save(update_fields=["status"])
+                state = _state(payment.user_id)
+                if state.state == "payment_pending":
+                    _move_state(state, "completed")
+        return Response({"success": True, "data": {"reference": reference, "status": payment.status}}, status=200)
+    except CommerceError as exc:
+        return Response({"success": False, "error": exc.message, "data": {}}, status=exc.status_code)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def paytech_success(request):
+    return Response(
+        {"success": True, "data": {"status": "paid", "message": "Paiement confirmé. Vous pouvez retourner sur WhatsApp."}},
+        status=200,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def paytech_cancel(request):
+    return Response(
+        {"success": True, "data": {"status": "canceled", "message": "Paiement annulé. Vous pouvez retourner sur WhatsApp."}},
+        status=200,
+    )
 
 
 def _get_order_status(data):
@@ -599,7 +690,8 @@ def _validate_coupon(data):
 
 def _check_variant_stock(data):
     _required(data, "product_id", "variant_id")
-    return _woo_only(data).check_variant_stock(data["product_id"], data["variant_id"])
+    platform = _platform(data.get("platform") or _catalog_platform())
+    return _client(platform).check_variant_stock(data["product_id"], data["variant_id"])
 
 
 def _transfer_to_human(data):
@@ -863,12 +955,21 @@ def _dispatch_intent(data):
         product = _client(_catalog_platform()).get_product(product_id)
         if product.get("prix") in (None, ""):
             raise CommerceError("Le prix de ce produit est indisponible.", 409)
+        variant_id = payload.get("variant_id")
+        price = product["prix"]
+        if variant_id:
+            variant = _client(_catalog_platform()).check_variant_stock(product_id, variant_id)
+            if not variant.get("en_stock"):
+                raise CommerceError("Cette variante est actuellement indisponible.", 409)
+            if variant.get("prix") not in (None, ""):
+                price = variant["prix"]
         result = _cart_add({
             "user_id": user_id,
             "product_id": product["id"],
             "product_name": product.get("nom") or "Produit",
             "quantity": payload.get("quantity", 1),
-            "price": product["prix"],
+            "price": price,
+            "variant_id": variant_id,
             "platform": _catalog_platform(),
         })
     elif intention in {"cart_remove", "cart_update_quantity"}:
@@ -1509,7 +1610,7 @@ def _message_turn_uncached(data):
             exc.message,
         )
         return {
-            "message": "Le service boutique est momentanément indisponible. Réessayez dans quelques instants.",
+            "message": "Je n’ai pas pu terminer cette demande. Veuillez réessayer dans quelques instants.",
             "silent": False,
             "trace_id": trace_id,
             "degraded": True,
@@ -1602,7 +1703,7 @@ def _write_api_log(*, user_id, action, success, error, started_at):
             user_id=str(user_id or "")[:100],
             action=str(action or "")[:100],
             success=bool(success),
-            error=str(error or "")[:2000],
+            error_message=str(error or "")[:2000],
             duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
         )
     except Exception:
@@ -1649,17 +1750,7 @@ def commerce(request):
         action = str(request.data.get("action") or "").strip()
         data = request.data.get("data", {})
         if action not in ALLOWED_ACTIONS:
-            succeeded = True
-            return Response(
-                {
-                    "success": True,
-                    "data": {
-                        "message": "Action non reconnue",
-                        "available_actions": sorted(ALLOWED_ACTIONS),
-                    },
-                },
-                status=200,
-            )
+            raise CommerceError("Action non reconnue.", 400)
         if isinstance(data, str):
             raw_data = data.strip()
             try:

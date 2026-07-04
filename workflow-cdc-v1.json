@@ -1,0 +1,76 @@
+{
+  "name": "AI Commerce Assistant - CDC v1",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "ai-commerce-cdc-v1", "responseMode": "onReceived", "options": {"responseCode": 200}},
+      "id": "01-webhook", "name": "01 Webhook OpenWA", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1, "position": [-1300, 0]
+    },
+    {
+      "parameters": {"jsCode": "const root=$input.first().json;const p=root.body??root;const d=p.data??p;const m=d.message??d;const fm=d.fromMe??d.key?.fromMe??d.id?.fromMe??m.fromMe??m.key?.fromMe??false;if([true,1,'true','1'].includes(typeof fm==='string'?fm.toLowerCase():fm))return [];const type=String(d.type??m.type??'text').toLowerCase();if(['ack','status','presence','revoked','reaction'].includes(type))return [];let text=d.body??d.text?.body??d.content??d.conversation??d.extendedTextMessage?.text??m.body??m.conversation??m.extendedTextMessage?.text??'';const media=Boolean(d.isMedia??m.isMedia??d.mimetype??m.mimetype??['image','document','video','audio','ptt','sticker'].includes(type));if(!String(text).trim())text=media?'[MEDIA_SANS_TEXTE]':'[MESSAGE_VIDE]';d.body=String(text).trim();return [{json:root}];"},
+      "id": "02-normalize", "name": "02 Normaliser message", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-1100, 0]
+    },
+    {
+      "parameters": {"jsCode": "const root=$input.first().json;const p=root.body??root;const d=p.data??p;const m=d.message??d;const h=root.headers??{};const k=String(h['x-openwa-idempotency-key']??h['X-OpenWA-Idempotency-Key']??'');const x=k.match(/^msg_([^_]+)_(?:true|false)_([^_]+)_/);const chatId=d.from??d.chatId??d.chat_id??d.key?.remoteJid??m.from??m.chatId??m.key?.remoteJid??p.from??p.chatId??x?.[2];const sessionId=p.sessionId??p.session_id??d.sessionId??d.session_id??x?.[1];const rawId=d.id?.id??d.id??d.key?.id??m.id?.id??m.id??m.key?.id??k??Date.now();if(!chatId||!sessionId)throw new Error('Identifiants OpenWA absents');return [{json:{chatId:String(chatId),userId:String(chatId),sessionId:String(sessionId),messageText:String(d.body??m.body??'').trim(),messageId:typeof rawId==='object'?JSON.stringify(rawId):String(rawId),timestamp:d.timestamp??m.timestamp??p.timestamp??Date.now()}}];"},
+      "id": "03-extract", "name": "03 Extraire message", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-900, 0]
+    },
+    {
+      "parameters": {"jsCode": "const s=$input.first().json;const n=s.messageText.toLocaleLowerCase('fr-SN').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[.!?]+$/g,'').trim();const r={bonjour:'Bonjour ! Comment puis-je vous aider ? 😊',bjr:'Bonjour ! Comment puis-je vous aider ? 😊',bonsoir:'Bonsoir ! Comment puis-je vous aider ? 😊',salam:'Bonjour ! Comment puis-je vous aider ? 😊',merci:'Avec plaisir ! 😊','👍':'Parfait 👍','🙏':'Avec plaisir 🙏'};const analysisBody=JSON.stringify({model:'moonshot-v1-8k',temperature:0.1,max_tokens:450,messages:[{role:'system',content:'Comprends le français, le wolof mélangé, l argot et les fautes. Retourne uniquement un JSON valide avec intention, params, confidence, langue_detectee et reformulation française. Intentions: search_products,get_product,cart_add,cart_view,cart_remove,cart_clear,cart_update_quantity,create_order,generate_payment,get_order_status,cancel_order,request_refund,update_order,get_tracking,validate_coupon,check_variant_stock,get_policy,transfer_to_human,confirm_action,cancel_pending_action,other. N invente jamais identifiant, prix, montant ou variante.'},{role:'user',content:s.messageText}]});return [{json:{...s,isBasic:Object.prototype.hasOwnProperty.call(r,n),candidate:r[n]??'',analysisBody}}];"},
+      "id": "04-basic", "name": "04 Message basique", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-700, 0]
+    },
+    {
+      "parameters": {"conditions":{"options":{"caseSensitive":true,"typeValidation":"strict","version":2},"conditions":[{"id":"basic","leftValue":"={{ $json.isBasic }}","rightValue":"","operator":{"type":"boolean","operation":"true","singleValue":true}}],"combinator":"and"},"options":{}},
+      "id": "05-route", "name": "05 Est basique", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [-500, 0]
+    },
+    {
+      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + $env.KIMI_API_KEY }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.analysisBody }}","options":{"timeout":20000}},
+      "id": "06-kimi-analyze", "name": "06 Kimi analyse", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [-280, 100], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"jsCode": "const s=$('04 Message basique').first().json;const res=$input.first().json;let raw=String(res?.choices?.[0]?.message?.content??'').replace(/```(?:json)?/gi,'').replace(/```/g,'').trim();let p={};try{const a=raw.indexOf('{'),b=raw.lastIndexOf('}');p=JSON.parse(a>=0&&b>a?raw.slice(a,b+1):raw)}catch{}const allowed=new Set(['search_products','get_product','cart_add','cart_view','cart_remove','cart_clear','cart_update_quantity','create_order','generate_payment','get_order_status','cancel_order','request_refund','update_order','get_tracking','validate_coupon','check_variant_stock','get_policy','transfer_to_human','confirm_action','cancel_pending_action','other']);let intention=allowed.has(p.intention)?p.intention:'other';let params=p.params&&typeof p.params==='object'&&!Array.isArray(p.params)?p.params:{};let confidence=Math.max(0,Math.min(1,Number(p.confidence)||0));if(!raw){const n=s.messageText.toLocaleLowerCase('fr-SN').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').trim();if(/produit|catalogue|article|montre|affiche/.test(n)){intention='search_products';params={query:'*'};confidence=1}else if(/panier/.test(n)){intention='cart_view';params={};confidence=1}else if(/livraison/.test(n)){intention='get_policy';params={policy_type:'delivery'};confidence=1}else if(/retour/.test(n)){intention='get_policy';params={policy_type:'returns'};confidence=1}else if(/remboursement/.test(n)){intention='get_policy';params={policy_type:'refund'};confidence=1}}const analysis={intention,params,confidence,langue_detectee:String(p.langue_detectee||'français'),reformulation:String(p.reformulation||s.messageText)};const body={action:'execute_intent',data:{user_id:s.userId,session_key:s.sessionId,message_id:s.messageId,timestamp:s.timestamp,idempotency_key:s.userId+':'+s.messageId+':'+intention,...analysis}};return [{json:{...s,analysis,djangoBody:JSON.stringify(body)}}];"},
+      "id": "07-parser", "name": "07 Parser intention", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-60, 100]
+    },
+    {
+      "parameters": {"method":"POST","url":"https://ai-commerce-api-babacare.onrender.com/api/commerce/","sendHeaders":true,"headerParameters":{"parameters":[{"name":"X-API-Token","value":"={{ $env.N8N_API_TOKEN }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.djangoBody }}","options":{"timeout":60000}},
+      "id": "08-django", "name": "08 Appeler Django API", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [160, 100], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"jsCode": "const s=$('07 Parser intention').first().json;const e=$input.first().json;const ok=e?.success===true&&e.data&&typeof e.data==='object';const result=ok?e.data:{executed:false,requires_clarification:true,clarification:'Je vérifie votre demande. Pouvez-vous la préciser en quelques mots ?'};if(result.human_takeover)return [];const r=result.result??{};let safe='';if(result.requires_clarification)safe=String(result.clarification||'Pouvez-vous préciser votre demande ?');else if(result.requires_confirmation)safe='Veuillez confirmer cette action en répondant oui, ou répondez non pour annuler.';else if(Array.isArray(r.products))safe=r.products.length?'Voici les produits disponibles :\\n'+r.products.map((x,i)=>(i+1)+'. '+(x.nom||'Produit')+(x.prix?' - '+x.prix+' FCFA':'')).join('\\n')+'\\nRépondez avec le numéro choisi.':'Aucun produit disponible.';else if(Array.isArray(r.items))safe=r.items.length?'Votre panier contient '+r.items.length+' article(s). Total : '+r.total+' FCFA.':'Votre panier est vide.';else if(r.content)safe=String(r.content);else if(r.payment_url)safe='Voici votre lien de paiement PayTech : '+r.payment_url;else if(result.executed)safe='Votre demande a bien été traitée.';else safe='Pouvez-vous préciser votre demande ?';const body={model:'moonshot-v1-8k',temperature:0.3,max_tokens:650,messages:[{role:'system',content:'Réponds strictement en français, naturellement, sans Markdown. Conserve exactement tous les faits, produits, prix, quantités et numéros de la réponse sûre.'},{role:'user',content:'Message client: '+s.messageText+'\\nRéponse sûre: '+safe}]};return [{json:{...s,commerceResult:result,safeAnswer:safe,formatBody:JSON.stringify(body)}}];"},
+      "id": "09-verify", "name": "09 Verifier resultat", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [380, 100]
+    },
+    {
+      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + $env.KIMI_API_KEY }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.formatBody }}","options":{"timeout":20000}},
+      "id": "10-kimi-format", "name": "10 Kimi formule reponse", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [600, 100], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"jsCode": "const input=$input.first().json;const s=$('04 Message basique').first().json;let safe='';try{safe=$('09 Verifier resultat').first().json.safeAnswer??''}catch{}let answer=String(input.candidate??input.choices?.[0]?.message?.content??safe??'').replace(/<think>[\\s\\S]*?<\\/think>/gi,'').replace(/[\\*~`_]/g,'').trim();if(!answer)answer=s.isBasic?s.candidate:'Je vérifie votre demande. Pouvez-vous la préciser en quelques mots ?';if(/(^|\\n)\\s*[{[]|system message|tool_calls|arguments/i.test(answer))answer=safe||'Je vérifie votre demande. Pouvez-vous la préciser en quelques mots ?';return [{json:{...s,reponse_finale:answer}}];"},
+      "id": "11-clean", "name": "11 Nettoyer reponse", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [820, 0]
+    },
+    {
+      "parameters": {"operation":"executeQuery","query":"INSERT INTO message_history (session_id, message) VALUES ($1, $2::jsonb);","options":{"queryReplacement":"={{ [$json.sessionId, JSON.stringify({user:$json.messageText,assistant:$json.reponse_finale,timestamp:new Date().toISOString()})] }}"}},
+      "id": "12-memory", "name": "12 Sauvegarder memoire", "type": "n8n-nodes-base.postgres", "typeVersion": 2.6, "position": [1040, 0], "alwaysOutputData": true, "onError": "continueRegularOutput", "credentials":{"postgres":{"id":"NqldjDUTxmFDZur8","name":"Postgres account 2"}}
+    },
+    {
+      "parameters": {"sessionId":"={{ $('11 Nettoyer reponse').first().json.sessionId }}","chatId":"={{ $('11 Nettoyer reponse').first().json.chatId }}","message":"={{ $('11 Nettoyer reponse').first().json.reponse_finale }}"},
+      "id": "13-send", "name": "13 Envoyer OpenWA", "type": "@rmyndharis/n8n-nodes-openwa.openWa", "typeVersion": 1, "position": [1260, 0], "credentials":{"openWaApi":{"id":"onObfWB7kdMkd5xj","name":"OpenWA account 2"}}
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "01 Webhook OpenWA":{"main":[[{"node":"02 Normaliser message","type":"main","index":0}]]},
+    "02 Normaliser message":{"main":[[{"node":"03 Extraire message","type":"main","index":0}]]},
+    "03 Extraire message":{"main":[[{"node":"04 Message basique","type":"main","index":0}]]},
+    "04 Message basique":{"main":[[{"node":"05 Est basique","type":"main","index":0}]]},
+    "05 Est basique":{"main":[[{"node":"11 Nettoyer reponse","type":"main","index":0}],[{"node":"06 Kimi analyse","type":"main","index":0}]]},
+    "06 Kimi analyse":{"main":[[{"node":"07 Parser intention","type":"main","index":0}]]},
+    "07 Parser intention":{"main":[[{"node":"08 Appeler Django API","type":"main","index":0}]]},
+    "08 Appeler Django API":{"main":[[{"node":"09 Verifier resultat","type":"main","index":0}]]},
+    "09 Verifier resultat":{"main":[[{"node":"10 Kimi formule reponse","type":"main","index":0}]]},
+    "10 Kimi formule reponse":{"main":[[{"node":"11 Nettoyer reponse","type":"main","index":0}]]},
+    "11 Nettoyer reponse":{"main":[[{"node":"12 Sauvegarder memoire","type":"main","index":0}]]},
+    "12 Sauvegarder memoire":{"main":[[{"node":"13 Envoyer OpenWA","type":"main","index":0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder":"v1","availableInMCP":false},
+  "meta": {"templateCredsSetupCompleted":true},
+  "tags": []
+}

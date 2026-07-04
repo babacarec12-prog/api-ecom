@@ -14,6 +14,9 @@ class Product(models.Model):
     stock = models.PositiveIntegerField(default=0)
     sku = models.CharField(max_length=100, blank=True)
     image_url = models.URLField(blank=True)
+    images = models.JSONField(default=list, blank=True)
+    variants = models.JSONField(default=list, blank=True)
+    platform = models.CharField(max_length=20, default="database", db_index=True)
     active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -28,6 +31,7 @@ class Cart(models.Model):
 
     user_id = models.CharField(max_length=50, db_index=True)
     product_id = models.CharField(max_length=50)
+    variant_id = models.CharField(max_length=50, blank=True, default="")
     product_name = models.CharField(max_length=255, blank=True)
     quantity = models.PositiveIntegerField(default=1)
     price = models.DecimalField(max_digits=10, decimal_places=2)
@@ -40,7 +44,8 @@ class Cart(models.Model):
         db_table = "carts"
         constraints = [
             models.UniqueConstraint(
-                fields=["user_id", "product_id"], name="unique_cart_product_per_user"
+                fields=["user_id", "product_id", "variant_id"],
+                name="unique_cart_product_variant_per_user",
             )
         ]
 
@@ -115,6 +120,27 @@ class UserOrder(models.Model):
         db_table = "user_orders"
 
 
+class PaymentTransaction(models.Model):
+    """Transaction PayTech persistante et mise à jour par les notifications IPN."""
+
+    user_id = models.CharField(max_length=50, db_index=True)
+    order_id = models.CharField(max_length=50, db_index=True)
+    reference = models.CharField(max_length=100, unique=True)
+    token = models.CharField(max_length=255, unique=True)
+    payment_url = models.URLField()
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default="XOF")
+    provider = models.CharField(max_length=20, default="paytech")
+    status = models.CharField(max_length=20, default="pending", db_index=True)
+    last_event = models.CharField(max_length=50, blank=True)
+    callback_payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "payment_transactions"
+
+
 class HumanTransfer(models.Model):
     """Demande persistante de prise en charge humaine."""
 
@@ -144,7 +170,7 @@ class ApiLog(models.Model):
     user_id = models.CharField(max_length=100, blank=True, db_index=True)
     action = models.CharField(max_length=100, blank=True, db_index=True)
     success = models.BooleanField(default=False, db_index=True)
-    error = models.TextField(blank=True)
+    error_message = models.TextField(blank=True)
     duration_ms = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 

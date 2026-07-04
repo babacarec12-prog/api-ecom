@@ -28,7 +28,7 @@ services:
       - key: DB_CONN_MAX_AGE
         value: "60"
       - key: COMMERCE_RATE_LIMIT
-        value: "120"
+        value: "60"
       - key: COMMERCE_CATALOG_PROVIDER
         value: database
       - key: KIMI_MODEL
@@ -39,9 +39,31 @@ services:
         value: "True"
       - key: WOO_VERIFY_SSL
         value: "True"
+      - key: WOO_STORE_URL
+        sync: false
+      - key: WOO_CONSUMER_KEY
+        sync: false
+      - key: WOO_CONSUMER_SECRET
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: N8N_API_TOKEN
         sync: false
       - key: KIMI_API_KEY
         sync: false
+      - key: PAYTECH_API_KEY
+        sync: false
+      - key: PAYTECH_API_SECRET
+        sync: false
+      - key: PAYTECH_API_URL
+        value: https://paytech.sn/api/payment/request-payment
+      - key: PAYTECH_CURRENCY
+        value: XOF
+      - key: PAYTECH_ENV
+        value: test
+      - key: PAYTECH_IPN_URL
+        value: https://ai-commerce-api-babacare.onrender.com/api/paytech/ipn/
+      - key: PAYTECH_SUCCESS_URL
+        value: https://ai-commerce-api-babacare.onrender.com/api/paytech/success/
+      - key: PAYTECH_CANCEL_URL
+        value: https://ai-commerce-api-babacare.onrender.com/api/paytech/cancel/

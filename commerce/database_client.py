@@ -23,7 +23,9 @@ class DatabaseCatalogClient:
             "prix": str(product.price),
             "stock": product.stock,
             "image": product.image_url or None,
-            "plateforme": "database",
+            "images": product.images or ([product.image_url] if product.image_url else []),
+            "variantes": product.variants or [],
+            "plateforme": product.platform,
         }
 
     def search_products(self, query):
@@ -50,6 +52,28 @@ class DatabaseCatalogClient:
             raise CommerceError("Produit introuvable dans le catalogue.", 404)
         return self._format(product)
 
+    def check_variant_stock(self, product_id, variant_id):
+        product = self.get_product(product_id)
+        variant = next(
+            (
+                item for item in product.get("variantes", [])
+                if str(item.get("id")) == str(variant_id)
+            ),
+            None,
+        )
+        if not variant:
+            raise CommerceError("Variante introuvable dans le catalogue.", 404)
+        stock = variant.get("stock")
+        return {
+            "product_id": str(product_id),
+            "variant_id": str(variant_id),
+            "en_stock": variant.get("en_stock", stock is None or int(stock) > 0),
+            "stock": stock,
+            "prix": variant.get("prix") or product.get("prix"),
+            "attributs": variant.get("attributs", []),
+            "plateforme": product.get("plateforme", "database"),
+        }
+
     def create_order(self, user_id, cart):
         items = []
         total = Decimal("0")
@@ -73,6 +97,7 @@ class DatabaseCatalogClient:
                 items.append(
                     {
                         "product_id": product.external_id,
+                        "variant_id": line.get("variant_id"),
                         "product_name": product.name,
                         "quantity": quantity,
                         "price": str(product.price),

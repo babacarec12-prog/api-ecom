@@ -1,18 +1,24 @@
 import os
+import hashlib
+import hmac
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from django.core.cache import cache
+from django.core.management import call_command
 from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
 from commerce.exceptions import CommerceError
 from commerce.paytech_client import PayTechClient
 from commerce.woo_client import WooCommerceClient
+from commerce.views import ALLOWED_ACTIONS, HANDLERS
 from commerce.models import (
     ApiLog,
     Cart,
     ConversationState,
     HumanTransfer,
+    PaymentTransaction,
     ProcessedRequest,
     ProductSelection,
     Product,
@@ -41,14 +47,29 @@ class CommerceEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"success": True, "data": {"products": []}})
 
-    def test_unknown_action_returns_available_actions(self):
+    def test_unknown_action_uses_error_contract(self):
         response = self.client.post(
             "/api/commerce/", {"action": "delete_order", "data": {}}, format="json"
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["success"])
-        self.assertEqual(response.json()["data"]["message"], "Action non reconnue")
-        self.assertIn("search_products", response.json()["data"]["available_actions"])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {"success": False, "error": "Action non reconnue.", "data": {}},
+        )
+
+    def test_all_cdc_actions_are_exposed_and_have_handlers(self):
+        cdc_actions = {
+            "search_products", "get_product", "check_variant_stock",
+            "save_selection_list", "get_product_by_position",
+            "cart_add", "cart_view", "cart_remove", "cart_update_quantity",
+            "cart_clear", "get_state", "set_state", "revert_state",
+            "create_order", "get_order_status", "cancel_order", "update_order",
+            "get_tracking", "generate_payment", "transfer_to_human",
+            "check_human_status", "request_refund", "validate_coupon",
+            "get_policy",
+        }
+        self.assertTrue(cdc_actions.issubset(ALLOWED_ACTIONS))
+        self.assertEqual(ALLOWED_ACTIONS, set(HANDLERS))
 
     def test_get_method_uses_error_contract(self):
         response = self.client.get("/api/commerce/")
@@ -71,6 +92,7 @@ class CommerceEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200)
         log = ApiLog.objects.get(user_id="log-user", action="cart_view")
         self.assertTrue(log.success)
+        self.assertEqual(log.error_message, "")
         self.assertGreaterEqual(log.duration_ms, 0)
 
     def test_unknown_user_has_empty_cart_default_state_and_no_human(self):
@@ -201,6 +223,17 @@ class PayTechClientTests(SimpleTestCase):
         with self.assertRaises(CommerceError):
             PayTechClient().generate_payment("456", "8900.5")
 
+    @patch.dict(os.environ, config)
+    def test_ipn_hmac_verification(self):
+        payload = {"item_price": "8900", "ref_command": "order-456-test"}
+        message = b"8900|order-456-test|test-api-key"
+        payload["hmac_compute"] = hmac.new(
+            b"test-api-secret", message, hashlib.sha256
+        ).hexdigest()
+        self.assertTrue(PayTechClient().verify_ipn(payload))
+        payload["hmac_compute"] = "invalid"
+        self.assertFalse(PayTechClient().verify_ipn(payload))
+
 
 class WooCommerceClientSearchTests(SimpleTestCase):
     config = {
@@ -317,6 +350,68 @@ class WooCommerceClientSearchTests(SimpleTestCase):
                 result = client.get_order_status("38")
 
                 self.assertEqual(result["statut"], api_status)
+
+    @patch.dict(os.environ, config)
+    def test_export_catalogue_includes_images_categories_stock_and_variants(self):
+        client = WooCommerceClient()
+        client._request = Mock(
+            side_effect=[
+                [{
+                    "id": 18,
+                    "name": "T-shirt Sénégal",
+                    "description": "Coton",
+                    "price": "7500",
+                    "stock_quantity": 8,
+                    "stock_status": "instock",
+                    "status": "publish",
+                    "sku": "TS-SN",
+                    "categories": [{"name": "Vêtements"}],
+                    "images": [{"src": "https://shop.example/tshirt.jpg"}],
+                    "variations": [21],
+                }],
+                [{
+                    "id": 21,
+                    "sku": "TS-SN-M",
+                    "price": "7500",
+                    "stock_quantity": 3,
+                    "stock_status": "instock",
+                    "attributes": [{"name": "Taille", "option": "M"}],
+                    "image": {"src": "https://shop.example/tshirt-m.jpg"},
+                }],
+            ]
+        )
+
+        result = client.export_catalogue()
+
+        self.assertEqual(result[0]["external_id"], "18")
+        self.assertEqual(result[0]["category"], "Vêtements")
+        self.assertEqual(result[0]["images"], ["https://shop.example/tshirt.jpg"])
+        self.assertEqual(result[0]["variants"][0]["id"], "21")
+        self.assertEqual(result[0]["variants"][0]["stock"], 3)
+
+
+class WooCommerceCatalogueSyncTests(TestCase):
+    @patch("commerce.management.commands.sync_woocommerce_catalog.WooCommerceClient")
+    def test_sync_is_idempotent_and_deactivates_missing_products(self, woo_class):
+        Product.objects.create(
+            external_id="99", name="Ancien produit", price="1000", stock=1,
+            platform="woocommerce", active=True,
+        )
+        woo_class.return_value.export_catalogue.return_value = [{
+            "external_id": "18", "name": "T-shirt Sénégal", "description": "Coton",
+            "category": "Vêtements", "price": "7500", "stock": 8,
+            "sku": "TS-SN", "image_url": "https://shop.example/tshirt.jpg",
+            "images": ["https://shop.example/tshirt.jpg"], "variants": [],
+            "platform": "woocommerce", "active": True,
+        }]
+
+        call_command("sync_woocommerce_catalog", stdout=StringIO())
+        call_command("sync_woocommerce_catalog", stdout=StringIO())
+
+        synced = Product.objects.get(external_id="18")
+        self.assertEqual(synced.stock, 8)
+        self.assertEqual(synced.platform, "woocommerce")
+        self.assertFalse(Product.objects.get(external_id="99").active)
 
 
 class WooCommerceOrderActionTests(SimpleTestCase):
@@ -866,6 +961,8 @@ class PersistentCommerceActionsTests(TestCase):
     def test_generate_payment_requires_real_owned_order_and_is_idempotent(self, paytech):
         paytech.return_value.generate_payment.return_value = {
             "payment_url": "https://pay.example/77",
+            "token": "token-77",
+            "reference": "order-77-test",
             "provider": "paytech",
         }
         ConversationState.objects.create(
@@ -887,6 +984,46 @@ class PersistentCommerceActionsTests(TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.json()["data"]["payment_url"], "https://pay.example/77")
         paytech.return_value.generate_payment.assert_called_once_with("77", 2500)
+        self.assertEqual(PaymentTransaction.objects.get(order_id="77").status, "pending")
+
+    @patch.dict(os.environ, PayTechClientTests.config)
+    def test_paytech_ipn_completes_order_and_is_idempotent(self):
+        UserOrder.objects.create(
+            user_id=self.user_id, order_id="77", amount_total="2500", status="pending"
+        )
+        ConversationState.objects.create(
+            user_id=self.user_id,
+            state="payment_pending",
+            previous_state="ordering",
+            pending_order_id="77",
+            pending_amount="2500",
+        )
+        PaymentTransaction.objects.create(
+            user_id=self.user_id,
+            order_id="77",
+            reference="order-77-ipn",
+            token="token-ipn-77",
+            payment_url="https://pay.example/77",
+            amount="2500",
+        )
+        payload = {
+            "type_event": "sale_complete",
+            "item_price": "2500",
+            "ref_command": "order-77-ipn",
+        }
+        message = b"2500|order-77-ipn|test-api-key"
+        payload["hmac_compute"] = hmac.new(
+            b"test-api-secret", message, hashlib.sha256
+        ).hexdigest()
+
+        first = self.client.post("/api/paytech/ipn/", payload, format="json")
+        second = self.client.post("/api/paytech/ipn/", payload, format="json")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(PaymentTransaction.objects.get(order_id="77").status, "paid")
+        self.assertEqual(UserOrder.objects.get(order_id="77").status, "processing")
+        self.assertEqual(ConversationState.objects.get(user_id=self.user_id).state, "completed")
 
     @patch("commerce.views.WooCommerceClient")
     def test_owner_is_required_for_order_status(self, woo_class):
@@ -1044,6 +1181,53 @@ class DatabaseCatalogTests(TestCase):
         self.assertEqual(repeated.json()["data"], confirmed.json()["data"])
         self.assertEqual(Product.objects.get(external_id="DB-TEST").stock, 4)
         self.assertFalse(Cart.objects.filter(user_id="full-message-db-user").exists())
+
+    def test_cart_keeps_variants_as_distinct_lines(self):
+        product = Product.objects.get(external_id="DB-TEST")
+        product.variants = [
+            {"id": "M", "prix": "5000", "stock": 3, "en_stock": True,
+             "attributs": [{"name": "Taille", "option": "M"}]},
+            {"id": "L", "prix": "5500", "stock": 2, "en_stock": True,
+             "attributs": [{"name": "Taille", "option": "L"}]},
+        ]
+        product.save(update_fields=["variants", "updated_at"])
+
+        for variant_id in ("M", "L"):
+            response = self.post(
+                "execute_intent",
+                {
+                    "user_id": self.user_id,
+                    "intention": "cart_add",
+                    "params": {
+                        "product_id": "DB-TEST",
+                        "variant_id": variant_id,
+                        "quantity": 1,
+                    },
+                    "confidence": 1,
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+        cart = self.post("cart_view", {"user_id": self.user_id}).json()["data"]
+        self.assertEqual(len(cart["items"]), 2)
+        self.assertEqual({item["variant_id"] for item in cart["items"]}, {"M", "L"})
+        self.assertEqual(cart["total"], "10500.00")
+
+        ambiguous = self.post(
+            "cart_update_quantity",
+            {"user_id": self.user_id, "product_id": "DB-TEST", "quantity": 2},
+        )
+        self.assertEqual(ambiguous.status_code, 400)
+        updated = self.post(
+            "cart_update_quantity",
+            {
+                "user_id": self.user_id,
+                "product_id": "DB-TEST",
+                "variant_id": "L",
+                "quantity": 2,
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
 
 
 class MessageTurnTests(TestCase):

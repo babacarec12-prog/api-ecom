@@ -1,6 +1,8 @@
 """Création de liens de paiement avec l'API PayTech."""
 
 import json
+import hashlib
+import hmac
 import os
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
@@ -111,3 +113,24 @@ class PayTechClient:
             "reference": reference,
             "provider": "paytech",
         }
+
+    def verify_ipn(self, payload):
+        """Vérifie une notification PayTech sans jamais comparer les clés en clair."""
+        amount = str(payload.get("item_price") or payload.get("amount") or "")
+        reference = str(payload.get("ref_command") or "")
+        received_hmac = str(payload.get("hmac_compute") or "").strip().lower()
+        if received_hmac and amount and reference:
+            message = f"{amount}|{reference}|{self.api_key}".encode("utf-8")
+            expected = hmac.new(
+                self.api_secret.encode("utf-8"), message, hashlib.sha256
+            ).hexdigest()
+            if hmac.compare_digest(expected, received_hmac):
+                return True
+
+        expected_key = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
+        expected_secret = hashlib.sha256(self.api_secret.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(
+            expected_key, str(payload.get("api_key_sha256") or "").lower()
+        ) and hmac.compare_digest(
+            expected_secret, str(payload.get("api_secret_sha256") or "").lower()
+        )
