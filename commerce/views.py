@@ -1208,6 +1208,15 @@ def _cancel_pending_intent(user_id, state):
 
 def _confirm_pending_intent(data, state):
     if not state.pending_action:
+        if state.pending_product_id:
+            return _dispatch_intent(
+                {
+                    **data,
+                    "intention": "cart_add",
+                    "params": {"product_id": state.pending_product_id, "quantity": 1},
+                    "confidence": 1,
+                }
+            )
         return _intent_clarification("confirm_action", "Aucune action n'attend de confirmation.")
     pending_action = state.pending_action
     stored = dict(state.pending_payload or {})

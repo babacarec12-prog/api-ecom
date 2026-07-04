@@ -1157,6 +1157,26 @@ class DatabaseCatalogTests(TestCase):
             UserOrder.objects.filter(order_id=result["order_id"], platform="database").exists()
         )
 
+    def test_confirm_after_product_selection_adds_product_to_cart(self):
+        ConversationState.objects.create(
+            user_id="selection-confirm-user",
+            state="selecting",
+            previous_state="browsing",
+            pending_product_id="DB-TEST",
+        )
+        response = self.post(
+            "execute_intent",
+            {
+                "user_id": "selection-confirm-user",
+                "intention": "confirm_action",
+                "params": {},
+                "confidence": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["data"]["executed"])
+        self.assertEqual(response.json()["data"]["result"]["total"], "5000.00")
+
     def test_full_message_flow_is_idempotent_and_clears_cart(self):
         def turn(message_id, message):
             return self.post(
