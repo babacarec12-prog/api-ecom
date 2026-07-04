@@ -22,7 +22,7 @@
       "id": "05-route", "name": "05 Est basique", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [-500, 0]
     },
     {
-      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + $env.KIMI_API_KEY }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.analysisBody }}","options":{"timeout":20000}},
+      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + String($env.KIMI_API_KEY || '').trim() }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.analysisBody }}","options":{"timeout":20000}},
       "id": "06-kimi-analyze", "name": "06 Kimi analyse", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [-280, 100], "onError": "continueRegularOutput"
     },
     {
@@ -30,7 +30,7 @@
       "id": "07-parser", "name": "07 Parser intention", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [-60, 100]
     },
     {
-      "parameters": {"method":"POST","url":"https://ai-commerce-api-babacare.onrender.com/api/commerce/","sendHeaders":true,"headerParameters":{"parameters":[{"name":"X-API-Token","value":"={{ $env.N8N_API_TOKEN }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.djangoBody }}","options":{"timeout":60000}},
+      "parameters": {"method":"POST","url":"https://ai-commerce-api-babacare.onrender.com/api/commerce/","sendHeaders":true,"headerParameters":{"parameters":[{"name":"X-API-Token","value":"={{ String($env.N8N_API_TOKEN || '').trim() }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.djangoBody }}","options":{"timeout":60000}},
       "id": "08-django", "name": "08 Appeler Django API", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [160, 100], "onError": "continueRegularOutput"
     },
     {
@@ -38,7 +38,7 @@
       "id": "09-verify", "name": "09 Verifier resultat", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [380, 100]
     },
     {
-      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + $env.KIMI_API_KEY }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.formatBody }}","options":{"timeout":20000}},
+      "parameters": {"method":"POST","url":"https://api.moonshot.ai/v1/chat/completions","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"={{ 'Bearer ' + String($env.KIMI_API_KEY || '').trim() }}"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"contentType":"raw","rawContentType":"application/json","body":"={{ $json.formatBody }}","options":{"timeout":20000}},
       "id": "10-kimi-format", "name": "10 Kimi formule reponse", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [600, 100], "onError": "continueRegularOutput"
     },
     {
