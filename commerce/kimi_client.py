@@ -53,7 +53,7 @@ class KimiClient:
     def __init__(self):
         self.api_key = str(getattr(settings, "KIMI_API_KEY", "") or "").strip()
         self.model = str(
-            getattr(settings, "KIMI_MODEL", "moonshot-v1-8k") or "moonshot-v1-8k"
+            getattr(settings, "KIMI_MODEL", "moonshot-v1-128k") or "moonshot-v1-128k"
         ).strip()
         self.timeout = int(getattr(settings, "KIMI_TIMEOUT", 15))
         if not self.api_key:
