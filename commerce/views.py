@@ -274,6 +274,13 @@ def _search(data):
     products = _client(data.get("platform") or _catalog_platform()).search_products(
         str(data["query"]).strip()
     )
+    query_normalized = _normalise_message(data["query"])
+    exact_matches = [
+        product for product in products
+        if _normalise_message(product.get("nom")) == query_normalized
+    ]
+    if exact_matches:
+        products = exact_matches
 
     # n8n affiche au maximum dix résultats. Lorsque l'identifiant WhatsApp est
     # fourni, enregistrer ici exactement cette liste évite de demander au LLM
@@ -295,12 +302,38 @@ def _search(data):
                 ],
             }
         )
+        # Une recherche précise avec un seul résultat devient la référence
+        # implicite de « le », « la », « celui-ci » ou « ajoute-le ».
+        state = _state(data["user_id"])
+        state.pending_product_id = str(products[0].get("id")) if len(products) == 1 else None
+        state.save(update_fields=["pending_product_id", "last_updated"])
     return {"products": products}
 
 
 def _get_product(data):
     _required(data, "product_id", "platform")
     return _client(data["platform"]).get_product(data["product_id"])
+
+
+def _resolve_product_reference(data):
+    """Résout une référence humaine sans demander au client un identifiant technique."""
+    query = str(
+        data.get("query")
+        or data.get("product_name")
+        or data.get("name")
+        or ""
+    ).strip()
+    if not query:
+        return None, []
+    products = _client(data.get("platform") or _catalog_platform()).search_products(query)
+    if not products:
+        return None, []
+    normalized = _normalise_message(query)
+    exact = [
+        product for product in products
+        if _normalise_message(product.get("nom")) == normalized
+    ]
+    return (exact[0] if exact else products[0] if len(products) == 1 else None), products
 
 
 def _cart_add(data):
@@ -788,7 +821,7 @@ def _conversation_turn(data):
         state.save()
         return {
             "handled": True,
-            "direct_response": _format_cart(cart) + "\nConfirmez-vous la création de cette commande ? Répondez oui ou non.",
+            "direct_response": _format_cart(cart) + "\nSouhaitez-vous confirmer cette commande ?",
             "cart": cart,
             "state": _state_payload(state),
         }
@@ -835,7 +868,7 @@ def _conversation_turn(data):
             "handled": True,
             "direct_response": (
                 f"Vous avez sélectionné {selected['product_name']} à {_money(selected['price'])} FCFA. "
-                "Souhaitez-vous l'ajouter au panier ?"
+                "Je peux vous l'ajouter au panier si vous le souhaitez."
             ),
             "selected_product": selected,
             "state": _state_payload(_state(user_id)),
@@ -872,7 +905,7 @@ def _conversation_turn(data):
             "direct_response": (
                 f"{product.get('nom')} est disponible à {_money(product.get('prix'))} FCFA"
                 + (f" ({product.get('stock')} en stock)." if product.get("stock") is not None else ".")
-                + " Souhaitez-vous l'ajouter au panier ?"
+                + " Je peux vous l'ajouter au panier si vous le souhaitez."
             ),
             "selected_product": product,
             "products": products,
@@ -883,7 +916,7 @@ def _conversation_turn(data):
     ]
     return {
         "handled": True,
-        "direct_response": "Voici les produits disponibles :\n" + "\n".join(lines) + "\nRépondez avec le numéro du produit choisi.",
+        "direct_response": "Voici ce que j'ai trouvé :\n" + "\n".join(lines) + "\nLequel vous intéresse ?",
         "products": products,
     }
 
@@ -945,14 +978,34 @@ def _dispatch_intent(data):
         elif payload.get("product_id"):
             result = _get_product(payload)
         else:
-            return _intent_clarification(intention, "Quel produit souhaitez-vous consulter ?")
+            product, products = _resolve_product_reference(payload)
+            if product:
+                _select_product_for_conversation(user_id, product)
+                result = {"selected_product": product}
+            elif products:
+                payload["query"] = str(payload.get("query") or payload.get("product_name") or "*")
+                result = _search(payload)
+            else:
+                return _intent_clarification(intention, "Quel produit vous intéresse ?")
     elif intention == "cart_add":
         product_id = payload.get("product_id") or state.pending_product_id
         if not product_id and payload.get("position") is not None:
             product_id = _get_product_by_position(payload)["product_id"]
+        product = None
         if not product_id:
-            return _intent_clarification(intention, "Quel produit souhaitez-vous ajouter au panier ?")
-        product = _client(_catalog_platform()).get_product(product_id)
+            product, products = _resolve_product_reference(payload)
+            if product:
+                product_id = product.get("id")
+            elif products:
+                return {
+                    "executed": False,
+                    "intention": intention,
+                    "requires_clarification": False,
+                    "result": _search({**payload, "query": payload.get("query") or payload.get("product_name")}),
+                }
+            else:
+                return _intent_clarification(intention, "Quel produit voulez-vous ajouter au panier ?")
+        product = product or _client(_catalog_platform()).get_product(product_id)
         if product.get("prix") in (None, ""):
             raise CommerceError("Le prix de ce produit est indisponible.", 409)
         variant_id = payload.get("variant_id")
@@ -1485,9 +1538,9 @@ def _format_french_message(analysis, commerce_result):
             prefix = _format_cart(summary["cart"]) + "\n"
         return (
             prefix
-            + "Voulez-vous "
+            + "Voulez-vous confirmer et "
             + labels.get(intention, "effectuer cette action")
-            + " ? Répondez oui pour confirmer ou non pour annuler."
+            + " ?"
         )
     if intention == "cancel_pending_action":
         return "L'action en attente a été annulée."
@@ -1511,13 +1564,13 @@ def _format_french_message(analysis, commerce_result):
             f"{_display_price(item.get('prix', item.get('price')))}"
             for index, item in enumerate(products, start=1)
         ]
-        return "Voici les produits disponibles :\n" + "\n".join(lines) + "\nRépondez avec le numéro du produit choisi."
+        return "Voici les produits disponibles :\n" + "\n".join(lines) + "\nLequel vous intéresse ?"
     selected = result.get("selected_product")
     if isinstance(selected, dict):
         return (
             f"{selected.get('product_name') or selected.get('nom') or 'Produit'}"
             f"{_display_price(selected.get('price', selected.get('prix')))}\n"
-            "Souhaitez-vous l'ajouter au panier ?"
+            "Je peux vous l'ajouter au panier si vous le souhaitez."
         )
     if isinstance(result.get("items"), list):
         if not result["items"]:
@@ -1552,7 +1605,7 @@ def _format_french_message(analysis, commerce_result):
             "Je peux vous renseigner sur nos produits, votre panier, une commande, "
             "la livraison ou un remboursement."
         )
-    return "Je n'ai pas bien compris votre demande. Pouvez-vous la préciser en quelques mots ?"
+    return "Je ne suis pas certain d'avoir compris. Qu'est-ce que vous souhaitez exactement ?"
 
 
 def _message_turn_uncached(data):
@@ -1587,7 +1640,25 @@ def _message_turn_uncached(data):
 
     degraded = False
     local_analysis = _fallback_analysis(message, state)
-    if local_analysis["intention"] != "other":
+    supplied_analysis = data.get("analysis")
+    if isinstance(supplied_analysis, dict):
+        analysis = _validated_message_analysis(supplied_analysis, message, state)
+        # Le moteur local ne remplace Kimi que lorsqu'il possède un signal
+        # déterministe et que l'analyse distante est vague ou peu fiable.
+        if (
+            local_analysis["intention"] != "other"
+            and (
+                analysis["intention"] == "other"
+                or analysis["confidence"] < 0.6
+                or (
+                    analysis["intention"] == "search_products"
+                    and analysis.get("params", {}).get("query") in (None, "", "*")
+                    and local_analysis.get("params", {}).get("query") not in (None, "", "*")
+                )
+            )
+        ):
+            analysis = local_analysis
+    elif local_analysis["intention"] != "other":
         # Les demandes fréquentes restent instantanées et continuent à marcher
         # même lorsque Moonshot est ralenti ou indisponible.
         analysis = local_analysis
@@ -1626,9 +1697,11 @@ def _message_turn_uncached(data):
             "error_type": "commerce_unavailable",
         }
     answer = _format_french_message(analysis, commerce_result)
-    answer, formulation_degraded = _naturalize_answer(
-        message, analysis, commerce_result, answer, trace_id
-    )
+    formulation_degraded = False
+    if data.get("naturalize", True):
+        answer, formulation_degraded = _naturalize_answer(
+            message, analysis, commerce_result, answer, trace_id
+        )
     degraded = degraded or formulation_degraded
     silent = answer is None
     logger.info(

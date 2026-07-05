@@ -1202,6 +1202,96 @@ class DatabaseCatalogTests(TestCase):
         self.assertEqual(Product.objects.get(external_id="DB-TEST").stock, 4)
         self.assertFalse(Cart.objects.filter(user_id="full-message-db-user").exists())
 
+    def test_message_turn_uses_supplied_kimi_analysis_and_resolves_product_name(self):
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "natural-cart-user",
+                "session_key": "natural-cart",
+                "message_id": "natural-cart-1",
+                "message": "ajoute-moi le Produit Test Dakar",
+                "naturalize": False,
+                "analysis": {
+                    "intention": "cart_add",
+                    "params": {"product_name": "Produit Test Dakar", "quantity": 1},
+                    "confidence": 0.97,
+                    "langue_detectee": "français",
+                    "reformulation": "Ajouter le produit au panier.",
+                },
+            },
+        )
+        payload = response.json()["data"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["analysis"]["intention"], "cart_add")
+        self.assertIn("Produit Test Dakar", payload["message"])
+        self.assertEqual(Cart.objects.get(user_id="natural-cart-user").quantity, 1)
+
+    def test_message_turn_context_corrects_vague_analysis_for_number_selection(self):
+        self.post(
+            "message_turn",
+            {
+                "user_id": "context-user",
+                "session_key": "context",
+                "message_id": "context-1",
+                "message": "Produit Test Dakar",
+                "naturalize": False,
+                "analysis": {
+                    "intention": "search_products",
+                    "params": {"query": "Produit Test Dakar"},
+                    "confidence": 0.98,
+                },
+            },
+        )
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "context-user",
+                "session_key": "context",
+                "message_id": "context-2",
+                "message": "1",
+                "naturalize": False,
+                "analysis": {"intention": "other", "params": {}, "confidence": 0.4},
+            },
+        )
+        payload = response.json()["data"]
+        self.assertEqual(payload["analysis"]["intention"], "get_product")
+        self.assertIn("Produit Test Dakar", payload["message"])
+
+    def test_single_search_result_supports_natural_pronoun_addition(self):
+        searched = self.post(
+            "message_turn",
+            {
+                "user_id": "pronoun-user",
+                "session_key": "pronoun",
+                "message_id": "pronoun-1",
+                "message": "vous avez le Produit Test Dakar ?",
+                "naturalize": False,
+                "analysis": {
+                    "intention": "search_products",
+                    "params": {"query": "Produit Test Dakar"},
+                    "confidence": 0.99,
+                },
+            },
+        )
+        self.assertEqual(
+            searched.json()["data"]["commerce"]["state"]["pending_product_id"],
+            "DB-TEST",
+        )
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "pronoun-user",
+                "session_key": "pronoun",
+                "message_id": "pronoun-2",
+                "message": "ajoutez-le au panier",
+                "naturalize": False,
+                "analysis": {"intention": "cart_add", "params": {}, "confidence": 0.96},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Produit Test Dakar", response.json()["data"]["message"])
+        self.assertEqual(Cart.objects.get(user_id="pronoun-user").quantity, 1)
+
     def test_cart_keeps_variants_as_distinct_lines(self):
         product = Product.objects.get(external_id="DB-TEST")
         product.variants = [
