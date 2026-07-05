@@ -12,7 +12,7 @@ from rest_framework.test import APIClient
 from commerce.exceptions import CommerceError
 from commerce.paytech_client import PayTechClient
 from commerce.woo_client import WooCommerceClient
-from commerce.views import ALLOWED_ACTIONS, HANDLERS
+from commerce.views import ALLOWED_ACTIONS, HANDLERS, _conversation_decision
 from commerce.models import (
     ApiLog,
     Cart,
@@ -25,6 +25,30 @@ from commerce.models import (
     ShopPolicy,
     UserOrder,
 )
+
+
+class ConversationDecisionMatrixTests(SimpleTestCase):
+    """Matrice de formulations libres qui ne doivent jamais dépendre de Kimi."""
+
+    def test_thirty_one_natural_decisions(self):
+        confirmations = [
+            "oui", "ok", "d'accord", "je confirme", "je valide", "valide",
+            "vas-y", "allez-y", "c'est bon", "tout est correct",
+            "vous pouvez continuer", "on peut continuer", "procédez",
+            "faites-le", "fais-le", "go", "waw", "waaw", "c'est correct",
+        ]
+        refusals = [
+            "non", "annule", "annulez", "laisse tomber", "pas maintenant",
+            "je refuse", "ne faites pas", "stop", "deedeet", "no",
+            "je ne confirme pas", "je ne valide pas",
+        ]
+        self.assertEqual(len(confirmations) + len(refusals), 31)
+        for phrase in confirmations:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(_conversation_decision(phrase), "confirm")
+        for phrase in refusals:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(_conversation_decision(phrase), "cancel")
 
 
 class CommerceEndpointTests(TestCase):
@@ -1291,6 +1315,69 @@ class DatabaseCatalogTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Produit Test Dakar", response.json()["data"]["message"])
         self.assertEqual(Cart.objects.get(user_id="pronoun-user").quantity, 1)
+
+    @patch("commerce.views.PayTechClient")
+    def test_natural_confirmation_then_payment_uses_active_order(self, paytech_class):
+        generate_payment = paytech_class.return_value.generate_payment
+        generate_payment.return_value = {
+            "provider": "paytech",
+            "reference": "PAY-NATURAL-1",
+            "token": "token-natural-1",
+            "payment_url": "https://paytech.example/pay/token-natural-1",
+        }
+        Cart.objects.create(
+            user_id="natural-order-user",
+            product_id="DB-TEST",
+            product_name="Produit Test Dakar",
+            quantity=1,
+            price="5000",
+            platform="database",
+        )
+
+        staged = self.post(
+            "message_turn",
+            {
+                "user_id": "natural-order-user",
+                "session_key": "natural-order",
+                "message_id": "natural-order-1",
+                "message": "je veux commander",
+                "naturalize": False,
+                "analysis": {"intention": "create_order", "params": {}, "confidence": 0.98},
+            },
+        ).json()["data"]
+        self.assertTrue(staged["commerce"]["requires_confirmation"])
+
+        confirmed = self.post(
+            "message_turn",
+            {
+                "user_id": "natural-order-user",
+                "session_key": "natural-order",
+                "message_id": "natural-order-2",
+                "message": "tout est correct",
+                "naturalize": False,
+                "analysis": {"intention": "other", "params": {}, "confidence": 0.9},
+            },
+        ).json()["data"]
+        self.assertEqual(confirmed["analysis"]["intention"], "confirm_action")
+        order_id = confirmed["commerce"]["result"]["order_id"]
+        self.assertIn(order_id, confirmed["message"])
+
+        payment = self.post(
+            "message_turn",
+            {
+                "user_id": "natural-order-user",
+                "session_key": "natural-order",
+                "message_id": "natural-order-3",
+                "message": "je dois payer non ?",
+                "naturalize": False,
+                "analysis": {"intention": "other", "params": {}, "confidence": 0.8},
+            },
+        ).json()["data"]
+        self.assertEqual(payment["analysis"]["intention"], "generate_payment")
+        self.assertIn("https://paytech.example/pay/token-natural-1", payment["message"])
+        self.assertEqual(generate_payment.call_count, 1)
+        self.assertEqual(generate_payment.call_args.args[0], order_id)
+        self.assertEqual(str(generate_payment.call_args.args[1]), "5000.00")
 
     def test_cart_keeps_variants_as_distinct_lines(self):
         product = Product.objects.get(external_id="DB-TEST")

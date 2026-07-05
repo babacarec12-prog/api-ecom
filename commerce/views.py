@@ -547,7 +547,13 @@ def _generate_payment(data):
         state = _state(data["user_id"])
         if state.state != "ordering" or str(state.pending_order_id) != str(data["order_id"]):
             raise CommerceError("Le paiement exige une commande WooCommerce créée et vérifiée.", 409)
-        _owned_order(data)
+        # La création de commande enregistre déjà sa propriété. Éviter ici
+        # d'initialiser inutilement WooCommerce pour une commande du catalogue
+        # interne ; conserver la vérification historique seulement si besoin.
+        if not UserOrder.objects.filter(
+            order_id=str(data["order_id"]), user_id=str(data["user_id"])
+        ).exists():
+            _owned_order(data)
         result = PayTechClient().generate_payment(data["order_id"], data["amount"])
         PaymentTransaction.objects.update_or_create(
             reference=result["reference"],
@@ -1352,11 +1358,41 @@ def _normalise_message(value):
 
 AFFIRMATIVE_MESSAGES = {
     "oui", "waw", "waaw", "yes", "ok", "d'accord", "d accord", "confirme",
-    "je confirme", "valide", "vas y",
+    "je confirme", "valide", "je valide", "vas y", "go", "c'est bon", "c est bon",
+    "tout est correct", "c'est correct", "c est correct", "vous pouvez continuer",
+    "on peut continuer", "procedez", "procédez", "faites le", "fais le",
 }
 NEGATIVE_MESSAGES = {
-    "non", "no", "deedeet", "annule", "laisse tomber", "du tout",
+    "non", "no", "deedeet", "annule", "annulez", "laisse tomber", "du tout",
+    "pas maintenant", "je refuse", "ne faites pas", "stop",
 }
+
+
+def _conversation_decision(message):
+    """Détecte une décision libre uniquement dans un contexte qui en attend une."""
+    normalized = _normalise_message(message)
+    if normalized in AFFIRMATIVE_MESSAGES or re.fullmatch(
+        r"(?:oui|ok|d accord|c est bon|tout est correct)(?:[.! ]+)?", normalized
+    ):
+        return "confirm"
+    if normalized in NEGATIVE_MESSAGES or re.fullmatch(
+        r"(?:non|annulez?|laisse tomber|pas maintenant)(?:[.! ]+)?", normalized
+    ):
+        return "cancel"
+    if re.search(
+        r"\b(je confirme|je valide|vous pouvez (?:continuer|proceder)|"
+        r"on peut (?:continuer|proceder)|tout (?:est|a l air) correct|"
+        r"c est (?:bon|correct)|allez y|vas y|faites le|fais le)\b",
+        normalized,
+    ):
+        return "confirm"
+    if re.search(
+        r"\b(ne (?:confirme|valide) pas|je (?:refuse|annule)|annulez|"
+        r"laisse tomber|pas maintenant|ne faites pas)\b",
+        normalized,
+    ):
+        return "cancel"
+    return None
 BASIC_FRENCH_RESPONSES = {
     "bonjour": "Bonjour ! Comment puis-je vous aider ? 😊",
     "bonsoir": "Bonsoir ! Comment puis-je vous aider ? 😊",
@@ -1398,7 +1434,9 @@ def _fallback_analysis(message, state):
             or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
         )
     )
-    if explicit_selection and state.state == "selecting":
+    if re.search(r"\b(paie|payer|paiement|regle|regler|lien de paiement|checkout)\b", normalized):
+        intention = "generate_payment"
+    elif explicit_selection and state.state == "selecting":
         intention, params = "get_product", {"position": int(selection_phrase.group(1))}
     elif re.search(
         r"\b(commande|commander|commandé|valide|valider|finalise|finaliser)\b",
@@ -1459,10 +1497,15 @@ def _validated_message_analysis(raw, message, state):
 
 def _apply_conversation_rules(analysis, message, state):
     normalized = _normalise_message(message)
-    if state.pending_action and normalized in AFFIRMATIVE_MESSAGES:
+    decision = _conversation_decision(message) if state.pending_action else None
+    if decision == "confirm":
         return {**analysis, "intention": "confirm_action", "params": {}, "confidence": 1}
-    if state.pending_action and normalized in NEGATIVE_MESSAGES:
+    if decision == "cancel":
         return {**analysis, "intention": "cancel_pending_action", "params": {}, "confidence": 1}
+    if state.state == "ordering" and state.pending_order_id and re.search(
+        r"\b(paie|payer|paiement|regle|regler|lien|checkout)\b", normalized
+    ):
+        return {**analysis, "intention": "generate_payment", "params": {}, "confidence": 1}
     if not state.pending_action and state.pending_product_id and normalized in AFFIRMATIVE_MESSAGES:
         return {**analysis, "intention": "cart_add", "params": {}, "confidence": 1}
     selection_match = re.search(r"\b(\d+)\b", normalized)
