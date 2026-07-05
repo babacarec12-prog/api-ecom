@@ -1519,15 +1519,15 @@ class MessageTurnTests(TestCase):
 
     @patch("commerce.views.WooCommerceClient")
     @patch("commerce.views.KimiClient")
-    def test_catalogue_uses_fast_local_path_without_kimi(self, kimi_class, woo_class):
+    def test_catalogue_uses_local_fallback_when_kimi_is_unavailable(self, kimi_class, woo_class):
         kimi_class.return_value.classify.side_effect = CommerceError("Kimi indisponible", 502)
         woo_class.return_value.search_products.return_value = [
             {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 3}
         ]
         payload = self.post_message("montre moi les produits").json()["data"]
-        self.assertFalse(payload["degraded"])
+        self.assertTrue(payload["degraded"])
         self.assertIn("Batterie externe", payload["message"])
-        kimi_class.assert_not_called()
+        kimi_class.return_value.classify.assert_called_once()
         woo_class.return_value.search_products.assert_called_once_with("*")
 
     @patch("commerce.views.KimiClient")
@@ -1545,6 +1545,40 @@ class MessageTurnTests(TestCase):
             payload["message"],
             "Je vais très bien, merci ! Comment puis-je vous aider ?",
         )
+
+    @patch("commerce.views.WooCommerceClient")
+    @patch("commerce.views.KimiClient")
+    def test_second_turn_kimi_receives_persisted_history_and_state(self, kimi_class, woo_class):
+        kimi_class.return_value.classify.side_effect = [
+            {
+                "intention": "search_products",
+                "params": {"query": "batterie"},
+                "confidence": 0.98,
+                "langue_detectee": "français",
+                "reformulation": "Le client cherche une batterie.",
+            },
+            {
+                "intention": "cart_add",
+                "params": {},
+                "confidence": 0.97,
+                "langue_detectee": "français",
+                "reformulation": "Ajouter le produit sélectionné.",
+            },
+        ]
+        product = {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 3}
+        woo_class.return_value.search_products.return_value = [product]
+        woo_class.return_value.get_product.return_value = product
+
+        self.post_message("batterie", message_id="history-1")
+        second = self.post_message("ajoute-la", message_id="history-2").json()["data"]
+
+        self.assertEqual(second["analysis"]["intention"], "cart_add")
+        second_context = kimi_class.return_value.classify.call_args_list[1].args[1]
+        self.assertEqual(second_context["recent_messages"][0]["content"], "batterie")
+        self.assertIn("Batterie externe", second_context["recent_messages"][1]["content"])
+        self.assertEqual(second_context["state"]["pending_product_id"], "10")
+        state = ConversationState.objects.get(user_id=self.user_id)
+        self.assertEqual(len(state.recent_messages), 4)
 
     def test_human_takeover_keeps_the_bot_silent(self):
         ConversationState.objects.create(user_id=self.user_id, state="human_takeover")

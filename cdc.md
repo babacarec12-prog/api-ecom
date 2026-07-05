@@ -84,17 +84,15 @@ OpenWA (réception/envoi messages)
 n8n Cloud (orchestration workflow)
       │
       ▼
-Kimi API moonshot-v1-8k (analyse intention LLM)
+Django REST API (cœur conversationnel + logique métier)
       │
-      ▼
-Django REST API (logique métier)
-      │
+      ├──► Kimi API moonshot-v1-128k (compréhension et formulation avec contexte)
       ├──► WooCommerce REST API (catalogue, commandes)
       ├──► PayTech API (paiements)
       └──► Supabase PostgreSQL (panier, états, mémoire)
       │
       ▼
-n8n (formulation réponse via Kimi)
+n8n (validation, journalisation et transport de la réponse finale)
       │
       ▼
 OpenWA (envoi réponse WhatsApp client)
@@ -289,15 +287,21 @@ CREATE TABLE api_logs (
 03 Extraire message      → chatId, userId, messageText, sessionId
 04 Message basique ?     → Détecte bonjour, merci, ok, 👍
 05 Est basique ?         → Branchement IF
-06 Kimi analyse          → Retourne intention JSON (confidence, params)
-07 Parser intention      → Extrait intention, params, confidence
-08 Appeler Django API    → POST /api/commerce/ avec X-API-Token
-09 Vérifier résultat     → human_takeover ? low_confidence ?
-10 Kimi formule réponse  → Réponse naturelle basée sur données Django
-11 Nettoyer réponse      → Supprime Markdown, détecte fuites internes
+06 Préparer conversation → Construit le tour avec message et identifiants
+07 Appeler cœur Django   → POST message_turn avec X-API-Token
+08 Vérifier contrat      → Valide message/silent/trace_id
+09 Préparer réponse      → Transmet uniquement les faits validés
+10 Contrôle qualité      → Bloque fuites internes et réponses mécaniques
+11 Nettoyer réponse      → Produit la chaîne finale OpenWA
 12 Sauvegarder mémoire   → INSERT dans message_history Supabase
 13 Envoyer OpenWA        → Réponse finale au client WhatsApp
 ```
+
+Le cœur Django charge avant chaque analyse les derniers échanges, l'état
+transactionnel, le panier, la dernière sélection et la commande active. Kimi
+ne reçoit jamais un message isolé pour décider d'une action métier. La sortie
+LLM reste une proposition structurée : Django valide les paramètres et reste
+l'unique autorité pour toute mutation commerciale.
 
 ---
 

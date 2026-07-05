@@ -179,6 +179,52 @@ def _state_payload(state):
     }
 
 
+def _conversation_snapshot(user_id, state, candidate_analysis=None):
+    """Contexte compact transmis au LLM, sans lui déléguer l'état métier."""
+    selections = ProductSelection.objects.filter(user_id=str(user_id)).order_by("position")[:10]
+    latest_order = UserOrder.objects.filter(user_id=str(user_id)).order_by("-created_at").first()
+    snapshot = {
+        "state": _state_payload(state),
+        "recent_messages": list(state.recent_messages or [])[-12:],
+        "cart": _cart_payload(user_id),
+        "last_selection": [
+            {
+                "position": row.position,
+                "product_name": row.product_name,
+                "product_id": row.product_id,
+            }
+            for row in selections
+        ],
+        "active_order": (
+            {
+                "order_id": latest_order.order_id,
+                "status": latest_order.status,
+                "amount": str(latest_order.amount_total) if latest_order.amount_total is not None else None,
+            }
+            if latest_order
+            else None
+        ),
+    }
+    if isinstance(candidate_analysis, dict):
+        snapshot["n8n_candidate_analysis"] = candidate_analysis
+    return snapshot
+
+
+def _remember_turn(user_id, user_message, assistant_message, analysis=None):
+    """Conserve six tours récents pour résoudre les références naturelles."""
+    state = _state(user_id)
+    history = list(state.recent_messages or [])
+    history.append({"role": "user", "content": str(user_message)[:1000]})
+    if assistant_message:
+        history.append({
+            "role": "assistant",
+            "content": str(assistant_message)[:2000],
+            "intention": str((analysis or {}).get("intention") or ""),
+        })
+    state.recent_messages = history[-12:]
+    state.save(update_fields=["recent_messages", "last_updated"])
+
+
 def _move_state(state, new_state, **pending):
     if new_state not in ALLOWED_STATES:
         raise CommerceError(f"État invalide : {new_state}.", 400)
@@ -1661,19 +1707,24 @@ def _message_turn_uncached(data):
     if state.state == "human_takeover":
         return {"message": None, "silent": True, "trace_id": trace_id}
     if message in {"", "[MESSAGE_VIDE]"}:
+        answer = "Pouvez-vous préciser votre demande ?"
+        _remember_turn(user_id, message, answer)
         return {
-            "message": "Pouvez-vous préciser votre demande ?",
+            "message": answer,
             "silent": False,
             "trace_id": trace_id,
         }
     if message == "[MEDIA_SANS_TEXTE]":
+        answer = "Décrivez-moi votre demande par écrit afin que je puisse vous aider."
+        _remember_turn(user_id, message, answer)
         return {
-            "message": "Décrivez-moi votre demande par écrit afin que je puisse vous aider.",
+            "message": answer,
             "silent": False,
             "trace_id": trace_id,
         }
     basic = BASIC_FRENCH_RESPONSES.get(_normalise_message(message))
     if basic:
+        _remember_turn(user_id, message, basic, {"intention": "other"})
         return {
             "message": basic,
             "silent": False,
@@ -1684,35 +1735,32 @@ def _message_turn_uncached(data):
     degraded = False
     local_analysis = _fallback_analysis(message, state)
     supplied_analysis = data.get("analysis")
-    if isinstance(supplied_analysis, dict):
-        analysis = _validated_message_analysis(supplied_analysis, message, state)
-        # Le moteur local ne remplace Kimi que lorsqu'il possède un signal
-        # déterministe et que l'analyse distante est vague ou peu fiable.
-        if (
-            local_analysis["intention"] != "other"
-            and (
-                analysis["intention"] == "other"
-                or analysis["confidence"] < 0.6
-                or (
-                    analysis["intention"] == "search_products"
-                    and analysis.get("params", {}).get("query") in (None, "", "*")
-                    and local_analysis.get("params", {}).get("query") not in (None, "", "*")
-                )
-            )
-        ):
-            analysis = local_analysis
-    elif local_analysis["intention"] != "other":
-        # Les demandes fréquentes restent instantanées et continuent à marcher
-        # même lorsque Moonshot est ralenti ou indisponible.
+    try:
+        raw_analysis = KimiClient().classify(
+            message,
+            _conversation_snapshot(user_id, state, supplied_analysis),
+        )
+        analysis = _validated_message_analysis(raw_analysis, message, state)
+    except CommerceError as exc:
+        degraded = True
+        logger.warning("Kimi indisponible pour message_turn trace=%s: %s", trace_id, exc.message)
+        analysis = (
+            _validated_message_analysis(supplied_analysis, message, state)
+            if isinstance(supplied_analysis, dict)
+            else local_analysis
+        )
+    # Un signal local déterministe protège les parcours essentiels si le LLM
+    # répond « other », reste vague ou perd un paramètre évident.
+    if local_analysis["intention"] != "other" and (
+        analysis["intention"] == "other"
+        or analysis["confidence"] < 0.6
+        or (
+            analysis["intention"] == local_analysis["intention"]
+            and not analysis.get("params")
+            and local_analysis.get("params")
+        )
+    ):
         analysis = local_analysis
-    else:
-        try:
-            raw_analysis = KimiClient().classify(message, _state_payload(state))
-            analysis = _validated_message_analysis(raw_analysis, message, state)
-        except CommerceError as exc:
-            degraded = True
-            logger.warning("Kimi indisponible pour message_turn trace=%s: %s", trace_id, exc.message)
-            analysis = local_analysis
     analysis = _apply_conversation_rules(analysis, message, state)
 
     intent_data = {
@@ -1732,8 +1780,10 @@ def _message_turn_uncached(data):
             exc.status_code,
             exc.message,
         )
+        answer = "Je n’ai pas pu terminer cette demande. Réessayez dans quelques instants."
+        _remember_turn(user_id, message, answer, analysis)
         return {
-            "message": "Je n’ai pas pu terminer cette demande. Veuillez réessayer dans quelques instants.",
+            "message": answer,
             "silent": False,
             "trace_id": trace_id,
             "degraded": True,
@@ -1747,6 +1797,8 @@ def _message_turn_uncached(data):
         )
     degraded = degraded or formulation_degraded
     silent = answer is None
+    if not silent:
+        _remember_turn(user_id, message, answer, analysis)
     logger.info(
         "message_turn terminé trace=%s intention=%s degraded=%s silent=%s",
         trace_id,

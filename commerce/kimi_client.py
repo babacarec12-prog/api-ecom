@@ -9,10 +9,11 @@ from django.conf import settings
 from .exceptions import CommerceError
 
 
-SYSTEM_PROMPT = """Tu classes les messages d'une boutique WhatsApp sénégalaise.
-Comprends le français, les fautes, l'argot et le wolof. La reformulation doit
-toujours être en français. Retourne UNIQUEMENT un objet JSON valide, sans
-Markdown.
+SYSTEM_PROMPT = """Tu comprends le prochain message d'un client d'une boutique
+WhatsApp sénégalaise. Tu reçois l'historique récent, l'état transactionnel, le
+panier, la sélection et la commande active. Interprète les pronoms et réponses
+courtes à partir de ce contexte. Comprends le français, les fautes, l'argot et
+le wolof mélangé. Retourne UNIQUEMENT un objet JSON valide, sans Markdown.
 
 Intentions autorisées : search_products, get_product, cart_add, cart_view,
 cart_remove, cart_clear, cart_update_quantity, create_order, generate_payment,
@@ -22,9 +23,22 @@ validate_coupon, check_variant_stock, get_policy, transfer_to_human, other.
 Règles :
 - une demande de catalogue ou de produits est search_products ; query vaut "*"
   si aucune recherche précise n'est donnée ;
+- un nom de produit seul est search_products avec ce nom dans query ;
+- « ajoute-le », « je le prends », « celui-là » utilisent le produit récemment
+  sélectionné ; ne demande pas son identifiant ;
 - un numéro seul après une liste est get_product avec position ;
+- « je valide », « c'est bon », « tout est correct » se comprennent selon
+  pending_action ; ne les transforme pas en nouvelle recherche ;
+- payer ou demander le lien utilise la commande active sans inventer order_id ;
 - n'invente jamais un identifiant, prix, montant, code ou variante ;
 - une discussion générale ou une salutation est other.
+
+Exemples :
+- contexte: liste affichée, message: « 2 » => get_product, position=2
+- contexte: produit Batterie sélectionné, message: « ajoute-la » => cart_add
+- contexte: pending_action=create_order, message: « tout est correct » => other
+  (Django appliquera la confirmation déterministe)
+- contexte: commande active, message: « je dois payer ? » => generate_payment
 
 Schéma exact :
 {"intention":"...","params":{"query":null,"position":null,"product_id":null,
@@ -35,15 +49,15 @@ Schéma exact :
 "reponse_generale":"réponse courte en français uniquement si intention=other, sinon null"}
 """
 
-FORMULATION_PROMPT = """Tu es l'assistant WhatsApp naturel d'une boutique au Sénégal.
-Réponds strictement en français, même si le client écrit en wolof. Utilise un
-ton chaleureux, humain et concis. Les données métier et la réponse sûre fournies
-sont la seule vérité : ne change aucun produit, prix, quantité, total, numéro de
-commande ou état. N'ajoute aucune information commerciale. Pour une liste,
-conserve toutes les lignes et tous les montants. Sans Markdown ni astérisques.
-Tu dois réellement reformuler : ne recopie pas mot pour mot la réponse sûre.
-Varie naturellement l'introduction et la conclusion selon le message du client.
-Retourne uniquement le message final destiné au client.
+FORMULATION_PROMPT = """Écris uniquement le prochain message WhatsApp de la
+boutique en français simple et naturel. Une réponse normale fait une ou deux
+phrases courtes. Ne salue pas au milieu d'une conversation. Interdictions :
+« Cher client », « Bien sûr », « Je suis ravi », « N'hésitez pas », « Veuillez
+patienter », « Merci de votre compréhension ». La réponse sûre et les données
+métier sont la seule vérité : conserve exactement produit, prix, quantité,
+total, référence et lien. N'invente rien, n'ajoute aucun conseil commercial et
+ne dicte jamais au client une formule de réponse. Une liste peut être plus
+longue. Sans Markdown. Retourne uniquement le message final.
 """
 
 
@@ -129,22 +143,9 @@ class KimiClient:
         ]
         raw = self._completion(
             messages,
-            temperature=0.75,
-            max_tokens=700,
+            temperature=0.3,
+            max_tokens=350,
         )
-        if " ".join(raw.split()).casefold() == " ".join(str(safe_answer).split()).casefold():
-            raw = self._completion(
-                [
-                    *messages,
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": "Cette réponse est trop mécanique. Reformule-la vraiment en français naturel tout en conservant exactement les faits.",
-                    },
-                ],
-                temperature=0.9,
-                max_tokens=700,
-            )
         answer = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE)
         answer = answer.replace("**", "").strip()
         if not answer:
@@ -161,6 +162,15 @@ class KimiClient:
         )
         if forbidden_english:
             raise CommerceError("Kimi n'a pas répondu strictement en français.", 502)
+        if re.search(
+            r"\b(cher client|bien sûr|je suis ravi|n'hésitez pas|"
+            r"merci de votre compréhension|assistance supplémentaire|"
+            r"veuillez patienter)\b",
+            answer.casefold(),
+        ):
+            raise CommerceError("Kimi a produit une formulation mécanique.", 502)
+        if len(answer) > len(str(safe_answer)) * 2 + 120:
+            raise CommerceError("Kimi a produit une réponse inutilement longue.", 502)
         safe_numbers = re.findall(r"\d+", str(safe_answer))
         answer_numbers = re.findall(r"\d+", answer)
         if any(number not in answer_numbers for number in safe_numbers):

@@ -84,6 +84,7 @@ class ConversationState(models.Model):
     )
     pending_action = models.CharField(max_length=50, blank=True, null=True)
     pending_payload = models.JSONField(default=dict, blank=True)
+    recent_messages = models.JSONField(default=list, blank=True)
     last_updated = models.DateTimeField(auto_now=True)
 
     class Meta:
