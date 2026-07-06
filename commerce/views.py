@@ -591,6 +591,21 @@ def _generate_payment(data):
 
     def execute():
         state = _state(data["user_id"])
+        existing = PaymentTransaction.objects.filter(
+            user_id=str(data["user_id"]),
+            order_id=str(data["order_id"]),
+            status="pending",
+        ).order_by("-created_at").first()
+        if existing:
+            return {
+                "provider": existing.provider,
+                "reference": existing.reference,
+                "token": existing.token,
+                "payment_url": existing.payment_url,
+                "amount": str(existing.amount),
+                "currency": existing.currency,
+                "status": existing.status,
+            }
         if state.state != "ordering" or str(state.pending_order_id) != str(data["order_id"]):
             raise CommerceError("Le paiement exige une commande WooCommerce créée et vérifiée.", 409)
         # La création de commande enregistre déjà sa propriété. Éviter ici
@@ -1334,6 +1349,32 @@ def _confirm_pending_intent(data, state):
         "confidence": 1,
     }
     result = _dispatch_intent(confirmed_data)
+    if (
+        pending_action == "create_order"
+        and data.get("auto_payment")
+        and result.get("executed")
+        and isinstance(result.get("result"), dict)
+    ):
+        order = result["result"]
+        try:
+            payment = _generate_payment({
+                "user_id": data["user_id"],
+                "order_id": order["order_id"],
+                "amount": order["montant_total"],
+                "idempotency_key": "payment:" + hashlib.sha256(
+                    f"{data['user_id']}:{order['order_id']}".encode("utf-8")
+                ).hexdigest(),
+            })
+            result["result"] = {
+                **order,
+                "payment_url": payment["payment_url"],
+                "payment_provider": payment.get("provider", "paytech"),
+            }
+        except CommerceError as exc:
+            # La commande reste valide même si le prestataire de paiement est
+            # momentanément indisponible. Le client reçoit une information
+            # exacte et pourra redemander son lien sans recréer la commande.
+            result["result"] = {**order, "payment_error": exc.message}
     state.refresh_from_db()
     state.pending_action = None
     state.pending_payload = {}
@@ -1472,6 +1513,11 @@ def _fallback_analysis(message, state):
         normalized,
     )
     selection_phrase = re.search(r"\b(\d+)\b", normalized)
+    add_signal = bool(re.search(
+        r"\b(ajoute|ajouter|mets|mettre|prends|prendre|achete|acheter|"
+        r"commande|commander|choisis|choisir)\b",
+        normalized,
+    ))
     explicit_selection = bool(
         selection_phrase
         and (
@@ -1483,11 +1529,12 @@ def _fallback_analysis(message, state):
     if re.search(r"\b(paie|payer|paiement|regle|regler|lien de paiement|checkout)\b", normalized):
         intention = "generate_payment"
     elif explicit_selection and state.state == "selecting":
-        intention, params = "get_product", {"position": int(selection_phrase.group(1))}
+        intention = "cart_add" if add_signal else "get_product"
+        params = {"position": int(selection_phrase.group(1))}
     elif re.search(
         r"\b(commande|commander|commandé|valide|valider|finalise|finaliser)\b",
         normalized,
-    ) and re.search(r"\b(commande|panier|le|la)\b", normalized):
+    ) and Cart.objects.filter(user_id=state.user_id).exists():
         intention = "create_order"
     elif re.search(r"\b(voir|affiche|montre|consulte)\b.{0,20}\b(panier|cart)\b", normalized) or normalized in {"panier", "mon panier"}:
         intention = "cart_view"
@@ -1543,6 +1590,19 @@ def _validated_message_analysis(raw, message, state):
 
 def _apply_conversation_rules(analysis, message, state):
     normalized = _normalise_message(message)
+    params = dict(analysis.get("params") or {})
+    selection_match = re.search(r"\b(\d+)\b", normalized)
+    add_signal = bool(re.search(
+        r"\b(ajoute|ajouter|mets|mettre|prends|prendre|achete|acheter|"
+        r"commande|commander|choisis|choisir|veux celui|veux celle)\b",
+        normalized,
+    ))
+    checkout_signal = bool(re.search(
+        r"\b(passe|passer|finalise|finaliser|valide|valider|cree|creer|"
+        r"commande|commander)\b",
+        normalized,
+    ))
+    cart_has_items = Cart.objects.filter(user_id=state.user_id).exists()
     decision = _conversation_decision(message) if state.pending_action else None
     if decision == "confirm":
         return {**analysis, "intention": "confirm_action", "params": {}, "confidence": 1}
@@ -1552,25 +1612,36 @@ def _apply_conversation_rules(analysis, message, state):
         r"\b(paie|payer|paiement|regle|regler|lien|checkout)\b", normalized
     ):
         return {**analysis, "intention": "generate_payment", "params": {}, "confidence": 1}
-    if not state.pending_action and state.pending_product_id and normalized in AFFIRMATIVE_MESSAGES:
-        return {**analysis, "intention": "cart_add", "params": {}, "confidence": 1}
-    selection_match = re.search(r"\b(\d+)\b", normalized)
-    explicit_selection = bool(
-        selection_match
-        and (
-            normalized.isdigit()
-            or re.search(r"\b(numero|choisis|choix|prends|selectionne)\b", normalized)
-            or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
-            or analysis.get("intention") == "get_product"
-        )
-    )
-    if explicit_selection and state.state == "selecting":
+    # Une position accompagnée d'une volonté d'achat ajoute directement le
+    # produit. Une position seule affiche seulement le détail.
+    if selection_match and state.state == "selecting":
+        position = int(selection_match.group(1))
+        if add_signal or analysis.get("intention") == "cart_add":
+            return {
+                **analysis,
+                "intention": "cart_add",
+                "params": {**params, "position": position},
+                "confidence": 1,
+            }
         return {
             **analysis,
             "intention": "get_product",
-            "params": {"position": int(selection_match.group(1))},
+            "params": {"position": position},
             "confidence": 1,
         }
+    # Après une sélection, une volonté d'achat sans identifiant réutilise
+    # toujours le produit courant.
+    if state.pending_product_id and add_signal and not cart_has_items:
+        return {**analysis, "intention": "cart_add", "params": params, "confidence": 1}
+    # Dès qu'un panier existe, une demande de finalisation concerne la commande
+    # et non une nouvelle recherche produit.
+    if cart_has_items and (
+        analysis.get("intention") == "create_order"
+        or (checkout_signal and not selection_match)
+    ):
+        return {**analysis, "intention": "create_order", "params": {}, "confidence": 1}
+    if not state.pending_action and state.pending_product_id and normalized in AFFIRMATIVE_MESSAGES:
+        return {**analysis, "intention": "cart_add", "params": {}, "confidence": 1}
     return analysis
 
 
@@ -1643,7 +1714,14 @@ def _format_french_message(analysis, commerce_result):
     ):
         total = result.get("montant_total", result.get("total"))
         suffix = f" Total : {_money(total)} {result.get('devise', 'XOF')}." if total not in (None, "") else ""
-        return f"Votre commande est confirmée. Référence : {result['order_id']}.{suffix}"
+        payment = (
+            "\nPaiement : " + str(result["payment_url"])
+            if result.get("payment_url")
+            else "\nLa commande est créée, mais le lien de paiement n'est pas encore disponible."
+            if result.get("payment_error")
+            else ""
+        )
+        return f"Votre commande est confirmée. Référence : {result['order_id']}.{suffix}{payment}"
     if isinstance(result.get("products"), list):
         products = result["products"][:10]
         if not products:
@@ -1768,6 +1846,7 @@ def _message_turn_uncached(data):
         "session_key": str(data.get("session_key") or "current"),
         "timestamp": data.get("timestamp"),
         "idempotency_key": f"{user_id}:{trace_id}:{analysis['intention']}",
+        "auto_payment": True,
         **analysis,
     }
     try:

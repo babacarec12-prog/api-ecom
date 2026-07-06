@@ -12,7 +12,12 @@ from rest_framework.test import APIClient
 from commerce.exceptions import CommerceError
 from commerce.paytech_client import PayTechClient
 from commerce.woo_client import WooCommerceClient
-from commerce.views import ALLOWED_ACTIONS, HANDLERS, _conversation_decision
+from commerce.views import (
+    ALLOWED_ACTIONS,
+    HANDLERS,
+    _apply_conversation_rules,
+    _conversation_decision,
+)
 from commerce.models import (
     ApiLog,
     Cart,
@@ -1225,6 +1230,71 @@ class DatabaseCatalogTests(TestCase):
         self.assertEqual(repeated.json()["data"], confirmed.json()["data"])
         self.assertEqual(Product.objects.get(external_id="DB-TEST").stock, 4)
         self.assertFalse(Cart.objects.filter(user_id="full-message-db-user").exists())
+
+    @patch("commerce.views.PayTechClient")
+    def test_required_catalogue_to_paid_order_flow(self, paytech_class):
+        paytech_class.return_value.generate_payment.return_value = {
+            "provider": "paytech",
+            "reference": "PAY-FLOW-1",
+            "token": "token-flow-1",
+            "payment_url": "https://paytech.example/pay/token-flow-1",
+        }
+
+        def turn(message_id, message):
+            return self.post(
+                "message_turn",
+                {
+                    "user_id": "required-flow-user",
+                    "session_key": "required-flow",
+                    "message_id": message_id,
+                    "message": message,
+                    "naturalize": False,
+                },
+            ).json()["data"]
+
+        catalogue = turn("required-1", "montre les produits")
+        self.assertEqual(catalogue["analysis"]["intention"], "search_products")
+        self.assertIn("2. Bissap naturel 1 litre", catalogue["message"])
+
+        added = turn("required-2", "je prends le 2")
+        self.assertEqual(added["analysis"]["intention"], "cart_add")
+        self.assertEqual(added["commerce"]["result"]["total"], "2500.00")
+        self.assertEqual(Cart.objects.get(user_id="required-flow-user").product_name, "Bissap naturel 1 litre")
+
+        summary = turn("required-3", "commander")
+        self.assertEqual(summary["analysis"]["intention"], "create_order")
+        self.assertTrue(summary["commerce"]["requires_confirmation"])
+        self.assertIn("Bissap naturel 1 litre", summary["message"])
+        self.assertIn("2 500", summary["message"])
+
+        confirmed = turn("required-4", "oui")
+        self.assertEqual(confirmed["analysis"]["intention"], "confirm_action")
+        self.assertIn("https://paytech.example/pay/token-flow-1", confirmed["message"])
+        self.assertTrue(UserOrder.objects.filter(user_id="required-flow-user").exists())
+        self.assertFalse(Cart.objects.filter(user_id="required-flow-user").exists())
+
+    def test_selection_arbitration_is_semantic_not_phrase_specific(self):
+        variants = ["ajoute le numéro 2", "je choisis le 2", "achète le 2"]
+        for index, phrase in enumerate(variants, start=1):
+            user_id = f"selection-variant-{index}"
+            self.post(
+                "execute_intent",
+                {
+                    "user_id": user_id,
+                    "session_key": user_id,
+                    "intention": "search_products",
+                    "params": {"query": "*"},
+                    "confidence": 1,
+                },
+            )
+            state = ConversationState.objects.get(user_id=user_id)
+            analysis = _apply_conversation_rules(
+                {"intention": "get_product", "params": {}, "confidence": 0.8},
+                phrase,
+                state,
+            )
+            self.assertEqual(analysis["intention"], "cart_add")
+            self.assertEqual(analysis["params"]["position"], 2)
 
     def test_message_turn_uses_supplied_kimi_analysis_and_resolves_product_name(self):
         response = self.post(

@@ -26,7 +26,8 @@ Règles :
 - un nom de produit seul est search_products avec ce nom dans query ;
 - « ajoute-le », « je le prends », « celui-là » utilisent le produit récemment
   sélectionné ; ne demande pas son identifiant ;
-- un numéro seul après une liste est get_product avec position ;
+- un numéro seul après une liste est get_product avec position ; une volonté
+  d'achat accompagnée du numéro est cart_add avec position ;
 - « je valide », « c'est bon », « tout est correct » se comprennent selon
   pending_action ; ne les transforme pas en nouvelle recherche ;
 - payer ou demander le lien utilise la commande active sans inventer order_id ;
@@ -35,7 +36,10 @@ Règles :
 
 Exemples :
 - contexte: liste affichée, message: « 2 » => get_product, position=2
+- contexte: liste affichée, message exprimant l'achat du numéro 2 => cart_add,
+  position=2
 - contexte: produit Batterie sélectionné, message: « ajoute-la » => cart_add
+- contexte: panier non vide, message demandant de finaliser => create_order
 - contexte: pending_action=create_order, message: « tout est correct » => other
   (Django appliquera la confirmation déterministe)
 - contexte: commande active, message: « je dois payer ? » => generate_payment
