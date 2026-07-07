@@ -1939,12 +1939,10 @@ def _message_turn_uncached(data):
             "error_type": "commerce_unavailable",
         }
     answer = _format_french_message(analysis, commerce_result)
-    formulation_degraded = False
-    if data.get("naturalize", True):
-        answer, formulation_degraded = _naturalize_answer(
-            message, analysis, commerce_result, answer, trace_id
-        )
-    degraded = degraded or formulation_degraded
+    # Architecture mono-appel : la classification Kimi fournit déjà la réponse
+    # générale, tandis que les réponses commerciales sont construites depuis
+    # les faits validés. Un second appel de style doublait la latence et pouvait
+    # réintroduire des formulations mécaniques sans améliorer la compréhension.
     silent = answer is None
     if not silent:
         _remember_turn(user_id, message, answer, analysis)
