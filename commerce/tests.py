@@ -1752,15 +1752,15 @@ class MessageTurnTests(TestCase):
 
     @patch("commerce.views.WooCommerceClient")
     @patch("commerce.views.KimiClient")
-    def test_catalogue_uses_local_fallback_when_kimi_is_unavailable(self, kimi_class, woo_class):
+    def test_catalogue_uses_fast_local_route_without_kimi(self, kimi_class, woo_class):
         kimi_class.return_value.classify.side_effect = CommerceError("Kimi indisponible", 502)
         woo_class.return_value.search_products.return_value = [
             {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 3}
         ]
         payload = self.post_message("montre moi les produits").json()["data"]
-        self.assertTrue(payload["degraded"])
+        self.assertFalse(payload["degraded"])
         self.assertIn("Batterie externe", payload["message"])
-        kimi_class.return_value.classify.assert_called_once()
+        kimi_class.return_value.classify.assert_not_called()
         woo_class.return_value.search_products.assert_called_once_with("*")
 
     @patch("commerce.views.KimiClient")
@@ -1802,12 +1802,12 @@ class MessageTurnTests(TestCase):
         woo_class.return_value.search_products.return_value = [product]
         woo_class.return_value.get_product.return_value = product
 
-        self.post_message("batterie", message_id="history-1")
-        second = self.post_message("ajoute-la", message_id="history-2").json()["data"]
+        self.post_message("j'ai besoin d'énergie en déplacement", message_id="history-1")
+        second = self.post_message("c'est celui-là", message_id="history-2").json()["data"]
 
         self.assertEqual(second["analysis"]["intention"], "cart_add")
         second_context = kimi_class.return_value.classify.call_args_list[1].args[1]
-        self.assertEqual(second_context["recent_messages"][0]["content"], "batterie")
+        self.assertEqual(second_context["recent_messages"][0]["content"], "j'ai besoin d'énergie en déplacement")
         self.assertIn("Batterie externe", second_context["recent_messages"][1]["content"])
         self.assertEqual(second_context["state"]["pending_product_id"], "10")
         state = ConversationState.objects.get(user_id=self.user_id)

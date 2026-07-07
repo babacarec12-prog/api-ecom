@@ -1550,6 +1550,15 @@ def _fallback_analysis(message, state):
         normalized,
     )
     selection_phrase = re.search(r"\b(\d+)\b", normalized)
+    quantity_words = {
+        "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4,
+        "cinq": 5, "naar": 2, "ñaar": 2,
+    }
+    word_quantity = next(
+        (value for word, value in quantity_words.items() if re.search(rf"\b{re.escape(word)}\b", normalized)),
+        None,
+    )
+    requested_quantity = int(selection_phrase.group(1)) if selection_phrase else word_quantity
     add_signal = bool(re.search(
         r"\b(ajoute|ajouter|mets|mettre|prends|prendre|achete|acheter|"
         r"commande|commander|choisis|choisir)\b",
@@ -1563,12 +1572,23 @@ def _fallback_analysis(message, state):
             or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
         )
     )
-    if re.search(r"\b(livraison|livrez|livrer|delai de livraison|frais de livraison)\b", normalized):
+    decision = _conversation_decision(message) if state.pending_action else None
+    if decision:
+        intention = "confirm_action" if decision == "confirm" else "cancel_pending_action"
+    elif re.search(r"\b(livraison|livrez|livrer|delai de livraison|frais de livraison)\b", normalized):
         intention, params = "get_policy", {"policy_type": "delivery"}
     elif re.search(r"\b(retour|retours|retourner|echanger|echange)\b", normalized):
         intention, params = "get_policy", {"policy_type": "returns"}
     elif re.search(r"\b(paie|payer|paiement|regle|regler|lien de paiement|checkout)\b", normalized):
         intention = "generate_payment"
+    elif Cart.objects.filter(user_id=state.user_id).exists() and re.search(
+        r"\b(enleve|enlever|retire|retirer|supprime|supprimer)\b", normalized
+    ):
+        intention = "cart_remove"
+    elif Cart.objects.filter(user_id=state.user_id).exists() and requested_quantity is not None and re.search(
+        r"\b(mets|met|quantite|au total|j en veux|ajoutes?|ajouter)\b", normalized
+    ):
+        intention, params = "cart_update_quantity", {"quantity": requested_quantity}
     elif explicit_selection and state.state == "selecting":
         intention = "cart_add" if add_signal else "get_product"
         params = {"position": int(selection_phrase.group(1))}
@@ -1577,6 +1597,14 @@ def _fallback_analysis(message, state):
         normalized,
     ) and Cart.objects.filter(user_id=state.user_id).exists():
         intention = "create_order"
+    elif state.pending_product_id and add_signal:
+        intention = "cart_add"
+        if requested_quantity is not None:
+            params["quantity"] = requested_quantity
+    elif state.state == "selecting" and add_signal and requested_quantity is not None:
+        latest = list(ProductSelection.objects.filter(user_id=state.user_id).order_by("position")[:2])
+        if len(latest) == 1:
+            intention, params = "cart_add", {"position": latest[0].position, "quantity": requested_quantity}
     elif re.search(r"\b(voir|affiche|montre|consulte)\b.{0,20}\b(panier|cart)\b", normalized) or normalized in {"panier", "mon panier"}:
         intention = "cart_view"
     elif commerce_words or product_question:
@@ -1883,20 +1911,27 @@ def _message_turn_uncached(data):
     degraded = False
     local_analysis = _fallback_analysis(message, state)
     supplied_analysis = data.get("analysis")
-    try:
-        raw_analysis = KimiClient().classify(
-            message,
-            _conversation_snapshot(user_id, state, supplied_analysis),
-        )
-        analysis = _validated_message_analysis(raw_analysis, message, state)
-    except CommerceError as exc:
-        degraded = True
-        logger.warning("Kimi indisponible pour message_turn trace=%s: %s", trace_id, exc.message)
-        analysis = (
-            _validated_message_analysis(supplied_analysis, message, state)
-            if isinstance(supplied_analysis, dict)
-            else local_analysis
-        )
+    # Les signaux déterministes évitent un aller-retour LLM pour les demandes
+    # commerciales explicites. Kimi reste réservé aux formulations ambiguës.
+    if isinstance(supplied_analysis, dict):
+        analysis = _validated_message_analysis(supplied_analysis, message, state)
+    elif local_analysis["intention"] != "other":
+        analysis = local_analysis
+    else:
+        try:
+            raw_analysis = KimiClient().classify(
+                message,
+                _conversation_snapshot(user_id, state, supplied_analysis),
+            )
+            analysis = _validated_message_analysis(raw_analysis, message, state)
+        except CommerceError as exc:
+            degraded = True
+            logger.warning("Kimi indisponible pour message_turn trace=%s: %s", trace_id, exc.message)
+            analysis = (
+                _validated_message_analysis(supplied_analysis, message, state)
+                if isinstance(supplied_analysis, dict)
+                else local_analysis
+            )
     # Un signal local déterministe protège les parcours essentiels si le LLM
     # répond « other », reste vague ou perd un paramètre évident.
     if local_analysis["intention"] != "other" and (
