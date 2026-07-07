@@ -7,12 +7,13 @@ import logging
 import re
 import time
 import unicodedata
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from django.conf import settings
-from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny
@@ -28,6 +29,7 @@ from .models import (
     HumanTransfer,
     ProcessedRequest,
     ProductSelection,
+    RateLimitBucket,
     PaymentTransaction,
     ShopPolicy,
     UserOrder,
@@ -265,7 +267,10 @@ def _cart_payload(user_id):
 def _owned_order(data, client=None):
     _required(data, "order_id", "user_id")
     order_id, user_id = str(data["order_id"]), str(data["user_id"])
-    if UserOrder.objects.filter(order_id=order_id, user_id=user_id).exists():
+    local_order = UserOrder.objects.filter(order_id=order_id).first()
+    if local_order and local_order.user_id != user_id:
+        raise CommerceError("Commande introuvable pour ce compte.", 404)
+    if local_order:
         return client or _woo_only(data)
 
     # Compatibilité avec les commandes créées avant la table user_orders.
@@ -425,7 +430,9 @@ def _cart_remove(data):
         query = query.filter(variant_id=str(data["variant_id"]))
     elif query.count() > 1:
         raise CommerceError("Précisez la variante à retirer du panier.", 400)
-    query.delete()
+    deleted, _ = query.delete()
+    if not deleted:
+        raise CommerceError("Ce produit n'est pas dans le panier.", 404)
     return _cart_payload(data["user_id"])
 
 
@@ -588,9 +595,15 @@ def _create_order(data):
 
 def _generate_payment(data):
     _required(data, "user_id", "order_id", "amount")
+    requested_amount = _decimal(data["amount"], "amount", positive=True)
 
     def execute():
         state = _state(data["user_id"])
+        order = UserOrder.objects.filter(order_id=str(data["order_id"])).first()
+        if not order or order.user_id != str(data["user_id"]):
+            raise CommerceError("Commande introuvable pour ce compte.", 404)
+        if order.amount_total is not None and requested_amount != order.amount_total:
+            raise CommerceError("Le montant ne correspond pas au total de la commande.", 409)
         existing = PaymentTransaction.objects.filter(
             user_id=str(data["user_id"]),
             order_id=str(data["order_id"]),
@@ -623,7 +636,7 @@ def _generate_payment(data):
                 "order_id": str(data["order_id"]),
                 "token": result["token"],
                 "payment_url": result["payment_url"],
-                "amount": _decimal(data["amount"], "amount", positive=True),
+                "amount": requested_amount,
                 "currency": "XOF",
                 "provider": "paytech",
                 "status": "pending",
@@ -697,9 +710,10 @@ def paytech_cancel(request):
 
 
 def _get_order_status(data):
-    row = UserOrder.objects.filter(
-        order_id=str(data.get("order_id")), user_id=str(data.get("user_id"))
-    ).first()
+    _required(data, "order_id", "user_id")
+    row = UserOrder.objects.filter(order_id=str(data["order_id"])).first()
+    if row and row.user_id != str(data["user_id"]):
+        raise CommerceError("Commande introuvable pour ce compte.", 404)
     if row and row.platform == "database":
         return {
             "order_id": row.order_id,
@@ -1777,7 +1791,9 @@ def _format_french_message(analysis, commerce_result):
 
 def _message_turn_uncached(data):
     """Traite un message complet et renvoie directement la réponse WhatsApp."""
-    _required(data, "user_id", "message")
+    _required(data, "user_id")
+    if "message" not in data or data["message"] is None:
+        raise CommerceError("Paramètre manquant: message", 400)
     user_id = str(data["user_id"])
     message = " ".join(str(data["message"]).strip().split())
     trace_id = str(data.get("message_id") or uuid4().hex)
@@ -1897,7 +1913,9 @@ def _message_turn_uncached(data):
 
 def _message_turn(data):
     """Garantit qu'un même message OpenWA n'est traité qu'une seule fois."""
-    _required(data, "user_id", "message")
+    _required(data, "user_id")
+    if "message" not in data or data["message"] is None:
+        raise CommerceError("Paramètre manquant: message", 400)
     turn_id = str(
         data.get("message_id") or data.get("timestamp") or uuid4().hex
     ).strip()
@@ -1974,15 +1992,18 @@ def _security_error(request):
     limit = int(getattr(settings, "COMMERCE_RATE_LIMIT", 60))
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
     ip = forwarded or request.META.get("REMOTE_ADDR", "unknown")
-    key = f"commerce-rate:{ip}"
-    if cache.add(key, 1, timeout=60):
-        count = 1
-    else:
-        try:
-            count = cache.incr(key)
-        except ValueError:
-            cache.set(key, 1, timeout=60)
-            count = 1
+    now = timezone.now()
+    with transaction.atomic():
+        bucket, _ = RateLimitBucket.objects.select_for_update().get_or_create(
+            client_ip=ip,
+            defaults={"window_started_at": now, "request_count": 0},
+        )
+        if now - bucket.window_started_at >= timedelta(seconds=60):
+            bucket.window_started_at = now
+            bucket.request_count = 0
+        bucket.request_count += 1
+        count = bucket.request_count
+        bucket.save(update_fields=["window_started_at", "request_count"])
     if count > limit:
         return Response({"success": False, "error": "Too Many Requests", "data": {}}, status=429)
     return None

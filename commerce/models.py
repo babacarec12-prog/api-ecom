@@ -178,3 +178,14 @@ class ApiLog(models.Model):
     class Meta:
         db_table = "api_logs"
         ordering = ["-created_at"]
+
+
+class RateLimitBucket(models.Model):
+    """Compteur partagé entre tous les workers Render pour une même IP."""
+
+    client_ip = models.CharField(max_length=64, unique=True)
+    window_started_at = models.DateTimeField()
+    request_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "commerce_rate_limits"

@@ -156,6 +156,81 @@ class CommerceEndpointTests(TestCase):
             {"success": False, "error": "Paramètre manquant: product_id", "data": {}},
         )
 
+    def test_empty_message_uses_conversational_clarification(self):
+        response = self.client.post(
+            "/api/commerce/",
+            {
+                "action": "message_turn",
+                "data": {"user_id": "empty-message", "message_id": "empty-1", "message": ""},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+        self.assertIn("préciser", response.json()["data"]["message"].casefold())
+
+    def test_cart_remove_missing_product_is_explicit(self):
+        response = self.client.post(
+            "/api/commerce/",
+            {"action": "cart_remove", "data": {"user_id": "cart-owner", "product_id": "absent"}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["success"])
+
+    def test_payment_amount_is_validated_before_provider_configuration(self):
+        response = self.client.post(
+            "/api/commerce/",
+            {
+                "action": "generate_payment",
+                "data": {
+                    "user_id": "pay-owner",
+                    "order_id": "pay-order",
+                    "amount": 0,
+                    "idempotency_key": "pay-zero",
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["success"])
+        self.assertIn("positif", response.json()["error"])
+
+    def test_wrong_order_owner_is_rejected_before_woocommerce_initialization(self):
+        UserOrder.objects.create(
+            user_id="real-owner", order_id="owned-order", platform="woocommerce"
+        )
+        response = self.client.post(
+            "/api/commerce/",
+            {
+                "action": "cancel_order",
+                "data": {"user_id": "wrong-owner", "order_id": "owned-order"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["success"])
+        self.assertNotIn("temporairement", response.json()["error"].casefold())
+
+    @override_settings(COMMERCE_RATE_LIMIT=2)
+    def test_rate_limit_is_shared_and_uniform(self):
+        for index in range(2):
+            response = self.client.post(
+                "/api/commerce/",
+                {"action": "cart_view", "data": {"user_id": f"rate-{index}"}},
+                format="json",
+                REMOTE_ADDR="203.0.113.9",
+            )
+            self.assertEqual(response.status_code, 200)
+        blocked = self.client.post(
+            "/api/commerce/",
+            {"action": "cart_view", "data": {"user_id": "rate-blocked"}},
+            format="json",
+            REMOTE_ADDR="203.0.113.9",
+        )
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(set(blocked.json()), {"success", "error", "data"})
+
     @patch("commerce.views.HANDLERS")
     def test_woocommerce_failure_is_normalized(self, handlers):
         handlers.__getitem__.return_value.side_effect = CommerceError(
