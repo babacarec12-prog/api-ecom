@@ -36,7 +36,7 @@ services:
       - key: KIMI_TIMEOUT
         value: "12"
       - key: KIMI_NATURAL_RESPONSES
-        value: "True"
+        value: "False"
       - key: WOO_VERIFY_SSL
         value: "True"
       - key: WOO_STORE_URL

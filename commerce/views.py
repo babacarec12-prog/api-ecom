@@ -1487,7 +1487,8 @@ AFFIRMATIVE_MESSAGES = {
 }
 NEGATIVE_MESSAGES = {
     "non", "no", "deedeet", "annule", "annulez", "laisse tomber", "du tout",
-    "pas maintenant", "je refuse", "ne faites pas", "stop",
+    "pas maintenant", "pas encore", "attends", "attends pas encore",
+    "je refuse", "ne faites pas", "stop",
 }
 
 
@@ -1511,7 +1512,7 @@ def _conversation_decision(message):
         return "confirm"
     if re.search(
         r"\b(ne (?:confirme|valide) pas|je (?:refuse|annule)|annulez|"
-        r"laisse tomber|pas maintenant|ne faites pas)\b",
+        r"laisse tomber|pas (?:maintenant|encore)|attends(?: pas encore)?|ne faites pas)\b",
         normalized,
     ):
         return "cancel"

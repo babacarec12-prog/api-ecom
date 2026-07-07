@@ -33,6 +33,8 @@ Règles :
 - payer ou demander le lien utilise la commande active sans inventer order_id ;
 - n'invente jamais un identifiant, prix, montant, code ou variante ;
 - une discussion générale ou une salutation est other.
+- reponse_generale vouvoie toujours le client et reste cohérente avec le ton
+  professionnel d'une boutique ; n'utilise jamais « tu », « te » ou « ton ».
 
 Exemples :
 - contexte: liste affichée, message: « 2 » => get_product, position=2
@@ -61,7 +63,8 @@ patienter », « Merci de votre compréhension ». La réponse sûre et les donn
 métier sont la seule vérité : conserve exactement produit, prix, quantité,
 total, référence et lien. N'invente rien, n'ajoute aucun conseil commercial et
 ne dicte jamais au client une formule de réponse. Une liste peut être plus
-longue. Sans Markdown. Retourne uniquement le message final.
+longue. Vouvoie toujours le client. Sans Markdown. Retourne uniquement le
+message final.
 """
 
 

@@ -115,7 +115,7 @@ KIMI_TIMEOUT = int(os.getenv("KIMI_TIMEOUT", "15"))
 KIMI_NATURAL_RESPONSES = (
     False
     if TESTING
-    else os.getenv("KIMI_NATURAL_RESPONSES", "True").lower() in {"1", "true", "yes"}
+    else os.getenv("KIMI_NATURAL_RESPONSES", "False").lower() in {"1", "true", "yes"}
 )
 
 CACHES = {

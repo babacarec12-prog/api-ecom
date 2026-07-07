@@ -117,6 +117,9 @@ class ConversationQualityInvariantTests(TestCase):
         self.assertEqual(result["params"], {"policy_type": "delivery"})
         self.assertEqual(result["confidence"], 1)
 
+    def test_wait_not_yet_cancels_pending_confirmation(self):
+        self.assertEqual(_conversation_decision("attends, pas encore"), "cancel")
+
     @patch("commerce.views.KimiClient")
     def test_clear_general_question_is_not_replaced_by_clarification(self, kimi_class):
         kimi_class.return_value.classify.return_value = {

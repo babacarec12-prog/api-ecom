@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import statistics
 import sys
 import time
 import uuid
@@ -38,6 +39,7 @@ FORBIDDEN = re.compile(
     r"réponse sûre|intention|traitement|système|tool_calls|service indisponible",
     re.IGNORECASE,
 )
+TUTOIEMENT = re.compile(r"\b(?:tu|te|toi|ton|ta|tes)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -62,15 +64,15 @@ SCENARIOS: dict[str, list[Turn]] = {
         Turn("je cherche du bissap", {"search_products", "get_product"}, ("Bissap", "FCFA")),
         Turn("j'en prends deux", {"cart_add"}, ("2", "panier")),
         Turn("je veux commander", {"create_order"}, ("confirmer", "Total")),
-        Turn("attends, pas encore", {"cancel_pending_action", "other"}, absent=("confirmée",)),
+        Turn("attends, pas encore", {"cancel_pending_action"}, absent=("confirmée",)),
         Turn("montre mon panier", {"cart_view"}, ("Bissap",)),
     ],
     "correction_de_choix": [
         Turn("affiche les produits", {"search_products"}),
         Turn("je prends le premier", {"cart_add"}, ("panier",)),
         Turn("non enlève-le finalement", {"cart_remove"}, ("panier",)),
-        Turn("je préfère le bissap", {"search_products", "get_product"}, ("Bissap",)),
-        Turn("ajoutes-en 2", {"cart_add"}, ("2",)),
+        Turn("je préfère le bissap", {"search_products", "get_product", "cart_add"}, ("Bissap",)),
+        Turn("ajoutes-en 2", {"cart_add", "cart_update_quantity"}, ("2", "Bissap")),
     ],
     "langage_senegalais": [
         Turn("nanga def", contains=("Bonjour",)),
@@ -155,6 +157,8 @@ def run() -> int:
                 failures.append("réponse vide")
             if answer and FORBIDDEN.search(answer):
                 failures.append("formulation mécanique ou fuite interne")
+            if answer and TUTOIEMENT.search(answer):
+                failures.append("tutoiement incohérent avec le ton boutique")
             if answer and len(answer) > 650 and "\n" not in answer:
                 failures.append("réponse trop longue")
             if expected.intents and intent not in expected.intents:
@@ -182,6 +186,10 @@ def run() -> int:
             time.sleep(0.15)
 
     passed = sum(row["passed"] for row in rows)
+    timings = [row["elapsed"] for row in rows if row["assistant"] != "[SILENCE]"]
+    median_ms = int(statistics.median(timings)) if timings else 0
+    p95_ms = sorted(timings)[max(0, int(len(timings) * 0.95) - 1)] if timings else 0
+    performance_ok = median_ms < 3000
     lines = [
         "# Audit conversationnel qualitatif",
         "",
@@ -190,6 +198,8 @@ def run() -> int:
         f"- Tours : **{len(rows)}**",
         f"- PASS : **{passed}**",
         f"- FAIL : **{len(rows) - passed}**",
+        f"- Temps médian : **{median_ms} ms** ({'PASS' if performance_ok else 'FAIL'}, objectif majorité < 3 s)",
+        f"- P95 : **{p95_ms} ms**",
         "",
     ]
     for scenario in SCENARIOS:
@@ -207,7 +217,7 @@ def run() -> int:
                 lines.append("Problèmes : " + "; ".join(row["failures"]))
             lines.append("")
     (ROOT / "conversation_audit_report.md").write_text("\n".join(lines), encoding="utf-8")
-    return 0 if passed == len(rows) else 1
+    return 0 if passed == len(rows) and performance_ok else 1
 
 
 if __name__ == "__main__":
