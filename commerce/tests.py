@@ -121,6 +121,61 @@ class ConversationQualityInvariantTests(TestCase):
         self.assertEqual(_conversation_decision("attends, pas encore"), "cancel")
 
     @patch("commerce.views.KimiClient")
+    def test_interested_numeric_selection_is_local_and_deterministic(self, kimi_class):
+        ConversationState.objects.create(user_id="quality-position", state="selecting")
+        ProductSelection.objects.create(
+            user_id="quality-position",
+            session_key="quality-position",
+            position=2,
+            product_id="DB-002",
+            product_name="Bissap naturel",
+            price="2500",
+        )
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "quality-position",
+                "message_id": "quality-position-1",
+                "message": "le 2 m'intéresse",
+                "naturalize": False,
+            },
+        )
+        self.assertEqual(response.json()["data"]["analysis"]["intention"], "get_product")
+        self.assertIn("Bissap", response.json()["data"]["message"])
+        kimi_class.assert_not_called()
+
+    @patch("commerce.views.KimiClient")
+    def test_human_transfer_has_priority_over_generic_i_want(self, kimi_class):
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "quality-human",
+                "message_id": "quality-human-1",
+                "message": "je veux parler à un conseiller",
+                "naturalize": False,
+            },
+        )
+        self.assertEqual(response.json()["data"]["analysis"]["intention"], "transfer_to_human")
+        self.assertEqual(ConversationState.objects.get(user_id="quality-human").state, "human_takeover")
+        kimi_class.assert_not_called()
+
+    @patch("commerce.views.KimiClient")
+    def test_simple_joke_is_safe_fast_and_professional(self, kimi_class):
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "quality-joke",
+                "message_id": "quality-joke-1",
+                "message": "raconte-moi une blague",
+                "naturalize": False,
+            },
+        )
+        answer = response.json()["data"]["message"]
+        self.assertIn("panier", answer)
+        self.assertNotIn("bien sûr", answer.casefold())
+        kimi_class.assert_not_called()
+
+    @patch("commerce.views.KimiClient")
     def test_clear_general_question_is_not_replaced_by_clarification(self, kimi_class):
         kimi_class.return_value.classify.return_value = {
             "intention": "other",

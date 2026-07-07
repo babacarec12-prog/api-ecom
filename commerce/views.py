@@ -1539,6 +1539,7 @@ def _fallback_analysis(message, state):
     normalized = _normalise_message(message)
     params = {}
     intention = "other"
+    general_answer = None
     commerce_words = re.search(
         r"\b(catalogue|catalog|produit|produits|article|articles|montre|affiche|"
         r"bissap|power bank|batterie|telephone|téléphone|chargeur|ordinateur|"
@@ -1568,13 +1569,19 @@ def _fallback_analysis(message, state):
         selection_phrase
         and (
             normalized.isdigit()
-            or re.search(r"\b(numero|choisis|choix|prends|selectionne)\b", normalized)
+            or re.search(r"\b(numero|choisis|choix|prends|selectionne|interesse|plait|prefere)\b", normalized)
             or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
         )
     )
     decision = _conversation_decision(message) if state.pending_action else None
     if decision:
         intention = "confirm_action" if decision == "confirm" else "cancel_pending_action"
+    elif re.search(r"\b(conseiller|humain|agent|service client)\b", normalized):
+        intention, params = "transfer_to_human", {"reason": "Demande du client"}
+    elif re.search(r"\b(blague|fais moi rire|faire rire)\b", normalized):
+        params = {}
+        intention = "other"
+        general_answer = "Pourquoi le panier était-il content ? Parce qu’il était bien rempli ! 😊"
     elif re.search(r"\b(livraison|livrez|livrer|delai de livraison|frais de livraison)\b", normalized):
         intention, params = "get_policy", {"policy_type": "delivery"}
     elif re.search(r"\b(retour|retours|retourner|echanger|echange)\b", normalized):
@@ -1618,8 +1625,6 @@ def _fallback_analysis(message, state):
         }
         query_words = [word for word in normalized.split() if word not in stop_words]
         params = {"query": " ".join(query_words) or "*"}
-    elif re.search(r"\b(conseiller|humain|agent|service client)\b", normalized):
-        intention, params = "transfer_to_human", {"reason": "Demande du client"}
     return {
         "intention": intention,
         "params": params,
@@ -1630,7 +1635,7 @@ def _fallback_analysis(message, state):
             else "français"
         ),
         "reformulation": str(message),
-        "reponse_generale": None,
+        "reponse_generale": general_answer,
     }
 
 
@@ -1915,7 +1920,7 @@ def _message_turn_uncached(data):
     # commerciales explicites. Kimi reste réservé aux formulations ambiguës.
     if isinstance(supplied_analysis, dict):
         analysis = _validated_message_analysis(supplied_analysis, message, state)
-    elif local_analysis["intention"] != "other":
+    elif local_analysis["intention"] != "other" or local_analysis.get("reponse_generale"):
         analysis = local_analysis
     else:
         try:
