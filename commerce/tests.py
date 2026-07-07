@@ -56,6 +56,91 @@ class ConversationDecisionMatrixTests(SimpleTestCase):
                 self.assertEqual(_conversation_decision(phrase), "cancel")
 
 
+class ConversationQualityInvariantTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def post(self, action, data):
+        return self.client.post(
+            "/api/commerce/", {"action": action, "data": data}, format="json"
+        )
+
+    def test_removing_selected_product_clears_stale_context(self):
+        Cart.objects.create(
+            user_id="quality-remove",
+            product_id="DB-001",
+            product_name="Batterie",
+            quantity=1,
+            price="22000",
+            platform="database",
+        )
+        ConversationState.objects.create(
+            user_id="quality-remove",
+            state="cart_review",
+            previous_state="selecting",
+            pending_product_id="DB-001",
+        )
+        response = self.post(
+            "cart_remove", {"user_id": "quality-remove", "product_id": "DB-001"}
+        )
+        state = ConversationState.objects.get(user_id="quality-remove")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(state.pending_product_id)
+        self.assertEqual(state.state, "browsing")
+
+    def test_explicit_preference_overrides_previous_selection(self):
+        state = ConversationState.objects.create(
+            user_id="quality-preference",
+            state="cart_review",
+            pending_product_id="DB-001",
+        )
+        result = _apply_conversation_rules(
+            {
+                "intention": "cart_add",
+                "params": {"product_name": "bissap"},
+                "confidence": 0.9,
+            },
+            "je préfère le bissap",
+            state,
+        )
+        self.assertEqual(result["intention"], "get_product")
+        self.assertEqual(result["params"], {"product_name": "bissap"})
+
+    def test_delivery_question_is_deterministic(self):
+        state = ConversationState.objects.create(user_id="quality-delivery")
+        result = _apply_conversation_rules(
+            {"intention": "other", "params": {}, "confidence": 0.2},
+            "vous livrez à Dakar ?",
+            state,
+        )
+        self.assertEqual(result["intention"], "get_policy")
+        self.assertEqual(result["params"], {"policy_type": "delivery"})
+        self.assertEqual(result["confidence"], 1)
+
+    @patch("commerce.views.KimiClient")
+    def test_clear_general_question_is_not_replaced_by_clarification(self, kimi_class):
+        kimi_class.return_value.classify.return_value = {
+            "intention": "other",
+            "params": {},
+            "confidence": 0.3,
+            "langue_detectee": "français",
+            "reformulation": "Le client demande une blague.",
+            "reponse_generale": "Avec plaisir : pourquoi le panier était-il heureux ? Il était bien rempli !",
+        }
+        response = self.post(
+            "message_turn",
+            {
+                "user_id": "quality-general",
+                "message_id": "quality-general-1",
+                "message": "raconte-moi une blague",
+                "naturalize": False,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("panier", response.json()["data"]["message"])
+        self.assertNotIn("préciser", response.json()["data"]["message"].casefold())
+
+
 class CommerceEndpointTests(TestCase):
     def setUp(self):
         self.client = APIClient()

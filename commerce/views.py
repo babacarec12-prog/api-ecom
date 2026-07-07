@@ -433,6 +433,12 @@ def _cart_remove(data):
     deleted, _ = query.delete()
     if not deleted:
         raise CommerceError("Ce produit n'est pas dans le panier.", 404)
+    state = _state(data["user_id"])
+    if str(state.pending_product_id or "") == str(data["product_id"]):
+        state.pending_product_id = None
+    if not Cart.objects.filter(user_id=str(data["user_id"])).exists():
+        state.previous_state, state.state = state.state, "browsing"
+    state.save()
     return _cart_payload(data["user_id"])
 
 
@@ -1069,10 +1075,26 @@ def _dispatch_intent(data):
             else:
                 return _intent_clarification(intention, "Quel produit vous intéresse ?")
     elif intention == "cart_add":
-        product_id = payload.get("product_id") or state.pending_product_id
+        # Une référence explicite dans le nouveau message est prioritaire sur
+        # l'ancien produit sélectionné. Cela évite que « je préfère le bissap »
+        # réajoute silencieusement le produit précédent.
+        explicit_reference = payload.get("query") or payload.get("product_name")
+        product = None
+        product_id = payload.get("product_id")
+        if not product_id and explicit_reference:
+            product, products = _resolve_product_reference(payload)
+            if product:
+                product_id = product.get("id")
+            elif products:
+                return {
+                    "executed": False,
+                    "intention": intention,
+                    "requires_clarification": False,
+                    "result": _search({**payload, "query": explicit_reference}),
+                }
+        product_id = product_id or state.pending_product_id
         if not product_id and payload.get("position") is not None:
             product_id = _get_product_by_position(payload)["product_id"]
-        product = None
         if not product_id:
             product, products = _resolve_product_reference(payload)
             if product:
@@ -1419,7 +1441,7 @@ def _execute_intent(data):
             raise CommerceError("confidence doit etre un nombre entre 0 et 1.", 400) from exc
         if not 0 <= confidence <= 1:
             raise CommerceError("confidence doit etre un nombre entre 0 et 1.", 400)
-        if confidence < 0.6:
+        if confidence < 0.6 and intention != "other":
             result = _intent_clarification(intention, "Pouvez-vous preciser votre demande ?")
             result["state"] = _state_payload(_state(data["user_id"]))
             return result
@@ -1540,7 +1562,11 @@ def _fallback_analysis(message, state):
             or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
         )
     )
-    if re.search(r"\b(paie|payer|paiement|regle|regler|lien de paiement|checkout)\b", normalized):
+    if re.search(r"\b(livraison|livrez|livrer|delai de livraison|frais de livraison)\b", normalized):
+        intention, params = "get_policy", {"policy_type": "delivery"}
+    elif re.search(r"\b(retour|retours|retourner|echanger|echange)\b", normalized):
+        intention, params = "get_policy", {"policy_type": "returns"}
+    elif re.search(r"\b(paie|payer|paiement|regle|regler|lien de paiement|checkout)\b", normalized):
         intention = "generate_payment"
     elif explicit_selection and state.state == "selecting":
         intention = "cart_add" if add_signal else "get_product"
@@ -1622,6 +1648,33 @@ def _apply_conversation_rules(analysis, message, state):
         return {**analysis, "intention": "confirm_action", "params": {}, "confidence": 1}
     if decision == "cancel":
         return {**analysis, "intention": "cancel_pending_action", "params": {}, "confidence": 1}
+    # Les politiques courantes ne nécessitent aucune clarification : les
+    # formulations locales et les noms de ville ne doivent pas perturber Kimi.
+    if re.search(r"\b(livraison|livrez|livrer|frais de livraison|delai de livraison)\b", normalized):
+        return {
+            **analysis,
+            "intention": "get_policy",
+            "params": {"policy_type": "delivery"},
+            "confidence": 1,
+        }
+    if re.search(r"\b(retour|retours|retourner|echanger|echange)\b", normalized):
+        return {
+            **analysis,
+            "intention": "get_policy",
+            "params": {"policy_type": "returns"},
+            "confidence": 1,
+        }
+    # Préférer un autre produit est une nouvelle sélection, pas l'autorisation
+    # de remettre l'ancien article au panier.
+    if re.search(r"\b(?:je )?(?:prefere|veux plutot|prends plutot)\b", normalized):
+        explicit = params.get("product_name") or params.get("query")
+        if explicit:
+            return {
+                **analysis,
+                "intention": "get_product",
+                "params": {"product_name": explicit},
+                "confidence": 1,
+            }
     if state.state == "ordering" and state.pending_order_id and re.search(
         r"\b(paie|payer|paiement|regle|regler|lien|checkout)\b", normalized
     ):
