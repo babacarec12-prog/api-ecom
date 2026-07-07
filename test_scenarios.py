@@ -140,6 +140,13 @@ class Runner:
         suggestion: str = "Vérifier le handler, ses préconditions et le format uniforme de réponse.",
     ) -> dict[str, Any]:
         passed = bool(predicate(status, payload)) and self.no_forbidden(payload)
+        payload_text = json.dumps(payload, ensure_ascii=False).casefold()
+        if not passed and "configuration paytech est incomplète" in payload_text:
+            cause = "Les variables PAYTECH_API_KEY/PAYTECH_API_SECRET de Render sont absentes ou contiennent encore des placeholders."
+            suggestion = "Renseigner les clés sandbox PayTech dans Render; aucun correctif views.py ne peut fabriquer ces secrets."
+        elif not passed and status == 403 and "_invalid_json" in payload:
+            cause = "Le pare-feu Render bloque la signature d'injection avant que la requête atteigne Django."
+            suggestion = "Considérer le blocage comme une protection active ou configurer Render pour renvoyer une erreur JSON uniforme."
         actual_reason = "OK" if passed else f"{reason}; HTTP={status}; réponse={json.dumps(payload, ensure_ascii=False)[:500]}"
         self.results.append(Result(section, name, passed, duration, status, actual_reason, cause, suggestion))
         print(("✅ PASS" if passed else "❌ FAIL") + f" [{section}] {name} ({duration} ms)")
