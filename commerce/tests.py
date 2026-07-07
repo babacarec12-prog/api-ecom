@@ -1812,7 +1812,7 @@ class MessageTurnTests(TestCase):
         woo_class.return_value.search_products.return_value = [
             {"id": "10", "nom": "Batterie externe", "prix": "22000", "stock": 3}
         ]
-        payload = self.post_message("montre moi les produits").json()["data"]
+        payload = self.post_message("montre-moi ce que vous avez").json()["data"]
         self.assertFalse(payload["degraded"])
         self.assertIn("Batterie externe", payload["message"])
         kimi_class.return_value.classify.assert_not_called()

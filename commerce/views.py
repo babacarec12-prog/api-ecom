@@ -1551,6 +1551,15 @@ def _fallback_analysis(message, state):
         normalized,
     )
     selection_phrase = re.search(r"\b(\d+)\b", normalized)
+    ordinal_positions = {
+        "premier": 1, "premiere": 1, "first": 1,
+        "deuxieme": 2, "second": 2, "seconde": 2,
+        "troisieme": 3, "quatrieme": 4, "cinquieme": 5,
+    }
+    ordinal_position = next(
+        (value for word, value in ordinal_positions.items() if re.search(rf"\b{word}\b", normalized)),
+        None,
+    )
     quantity_words = {
         "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4,
         "cinq": 5, "naar": 2, "ñaar": 2,
@@ -1561,14 +1570,15 @@ def _fallback_analysis(message, state):
     )
     requested_quantity = int(selection_phrase.group(1)) if selection_phrase else word_quantity
     add_signal = bool(re.search(
-        r"\b(ajoute|ajouter|mets|mettre|prends|prendre|achete|acheter|"
-        r"commande|commander|choisis|choisir)\b",
+        r"\b(ajoutes?|ajouter|mets|mettre|prends?|prendre|pren|achete|acheter|"
+        r"commande|commander|choisis|choisir|beg|beug)\b",
         normalized,
     ))
     explicit_selection = bool(
-        selection_phrase
+        (selection_phrase or ordinal_position is not None)
         and (
             normalized.isdigit()
+            or ordinal_position is not None
             or re.search(r"\b(numero|choisis|choix|prends|selectionne|interesse|plait|prefere)\b", normalized)
             or re.search(r"\bbi\b.{0,20}\b(nekh|bakh|baax)\b", normalized)
         )
@@ -1598,7 +1608,7 @@ def _fallback_analysis(message, state):
         intention, params = "cart_update_quantity", {"quantity": requested_quantity}
     elif explicit_selection and state.state == "selecting":
         intention = "cart_add" if add_signal else "get_product"
-        params = {"position": int(selection_phrase.group(1))}
+        params = {"position": int(selection_phrase.group(1)) if selection_phrase else ordinal_position}
     elif re.search(
         r"\b(commande|commander|commandé|valide|valider|finalise|finaliser)\b",
         normalized,
@@ -1612,10 +1622,19 @@ def _fallback_analysis(message, state):
         latest = list(ProductSelection.objects.filter(user_id=state.user_id).order_by("position")[:2])
         if len(latest) == 1:
             intention, params = "cart_add", {"position": latest[0].position, "quantity": requested_quantity}
-    elif re.search(r"\b(voir|affiche|montre|consulte)\b.{0,20}\b(panier|cart)\b", normalized) or normalized in {"panier", "mon panier"}:
+    elif Cart.objects.filter(user_id=state.user_id).exists() and (
+        re.search(r"\b(panier|cart)\b", normalized)
+        or re.search(r"\b(combien|total)\b", normalized)
+    ):
         intention = "cart_view"
     elif commerce_words or product_question:
         intention = "search_products"
+        generic_catalogue = bool(re.search(
+            r"\b(catalogue|catalog|produits|articles)\b|"
+            r"\b(montre|affiche|voir)\b.{0,30}\b(ce que|quoi|avez|disponible)\b|"
+            r"\b(vous avez quoi|ce que vous avez|quoi comme produit|koi kom produit)\b",
+            normalized,
+        ))
         stop_words = {
             "a", "affiche", "ai", "am", "amo", "avez", "beug", "beg", "catalog",
             "catalogue", "dama", "de", "des", "du", "en", "est", "il", "je", "la",
@@ -1624,7 +1643,7 @@ def _fallback_analysis(message, state):
             "vous", "veux", "y", "yi", "disponible", "disponibles",
         }
         query_words = [word for word in normalized.split() if word not in stop_words]
-        params = {"query": " ".join(query_words) or "*"}
+        params = {"query": "*" if generic_catalogue else (" ".join(query_words) or "*")}
     return {
         "intention": intention,
         "params": params,
